@@ -1,0 +1,1176 @@
+-- AutoFarm Hub (FoxFish) — ตกปลา + ฟามจุดเดิม + ขายออโต้ ในสคริปต์เดียว
+-- UI แดง-ดำ | โหมดเดินทาง: วาป / เดินไว | กลับจุดฟามแล้วหันหน้าทางเดิมเป๊ะ
+-- อ้างอิง: WFR10_040052 / REELPROBE_040546 / WFR10_045808 / WFR10_101732 / WFR10_104211 / WFR10_111518
+-- แก้: ขายปลา = กดปุ่มเปิดร้านค้า (รอสัญญาณ shop จากเซิร์ฟเวอร์) -> กดปุ่มขายในร้าน -> ปิดร้าน
+
+local Players            = game:GetService("Players")
+local RS                 = game:GetService("ReplicatedStorage")
+local UIS                = game:GetService("UserInputService")
+local RunService         = game:GetService("RunService")
+local GuiService         = game:GetService("GuiService")
+local HttpService        = game:GetService("HttpService")
+local PathfindingService = game:GetService("PathfindingService")
+local lp                 = Players.LocalPlayer
+
+-- ==================== ตั้งค่า ====================
+local CFG = {
+    SELL_SPOTS   = { Vector3.new(418.12, 12.98, 524.40), Vector3.new(255.04, 12.74, -19.41) },
+    WALK_SPEED   = 40,     -- ความเร็วโหมดเดินไว
+    WALK_TIMEOUT = 25,     -- เดินนานเกินนี้ (วิ) -> วาปแทน
+    WARP_WAIT    = 0.35,   -- รอหลังถึงจุดก่อนขาย/ตี
+    SELL_MARGIN  = 1,      -- ขายเมื่อที่ว่างเหลือ <= ค่านี้
+    FALLBACK_MAX = 50,     -- ความจุกระเป๋า ถ้าอ่านจาก GUI ไม่ได้
+    CAST_MIN = 0.93, CAST_MAX = 0.99,
+    HOOK_DELAY = {0.45, 0.8}, RECAST_WAIT = {1.2, 2.0},
+    WATCHDOG = 45, REEL_LIMIT = 40,
+    LOOKAHEAD = 0.12, DEADBAND = 2,
+    FAIL_LIMIT = 2, CAST_TIMEOUT = 5, PAUSE_BOTH = 15,
+}
+local ROD_ORDER = {"FoxRodFresh", "FoxRodSea"}
+local ROD_NAME  = {FoxRodFresh = "น้ำจืด", FoxRodSea = "ทะเล"}
+
+-- ค่าที่ปรับจาก UI (เซฟลงไฟล์ถ้า executor รองรับ)
+local S = {mode = "warp", fishRod = "auto", autoSell = true, sellMode = "shop", fastReel = false, spotName = ""}
+local spots = {}   -- {name=, c={12 ตัวเลขของ CFrame}}
+local FILE = "AutoFarmHub.json"
+
+local function saveAll()
+    if type(writefile) ~= "function" then return end
+    pcall(function() writefile(FILE, HttpService:JSONEncode({S = S, spots = spots})) end)
+end
+pcall(function()
+    if type(readfile) ~= "function" then return end
+    if type(isfile) == "function" and not isfile(FILE) then return end
+    local t = HttpService:JSONDecode(readfile(FILE))
+    if type(t.S) == "table" then for k, v in pairs(t.S) do S[k] = v end end
+    if type(t.spots) == "table" then spots = t.spots end
+end)
+
+-- ==================== รีโมต ====================
+local FishFolder = RS:WaitForChild("FoxFish", 10)
+local Remote = FishFolder and FishFolder:WaitForChild("Remote", 10)
+local Req    = FishFolder and FishFolder:WaitForChild("Request", 10)
+local BagAction = RS:FindFirstChild("FoxHUD") and RS.FoxHUD:FindFirstChild("BagAction")
+if not (Remote and Req) then warn("[AutoFarmHub] ไม่พบ FoxFish.Remote/Request") return end
+
+local ENV = (type(getgenv) == "function" and getgenv()) or _G
+for _, k in ipairs({"__AFH_KILL", "__AUTOFISH_KILL", "__AUTOSELL_KILL"}) do
+    if ENV[k] then pcall(ENV[k]) end
+end
+
+-- ==================== ตัวช่วย ====================
+local alive = true
+local conns = {}
+local statusLbl, statLbl
+local statusMsg = "พร้อม"
+local function setStatus(m)
+    statusMsg = m
+    if statusLbl then statusLbl.Text = m end
+end
+local function rnd(r) return r[1] + math.random() * (r[2] - r[1]) end
+local function root() local c = lp.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+local function hum() local c = lp.Character; return c and c:FindFirstChildOfClass("Humanoid") end
+
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local function fakeInput(state, x, y)
+    return {
+        UserInputType = Enum.UserInputType.Touch, UserInputState = state,
+        KeyCode = Enum.KeyCode.Unknown, Position = Vector3.new(x, y, 0), Delta = Vector3.zero,
+        IsA = function() return true end,
+    }
+end
+
+local function callConns(sig, ...)
+    local n = 0
+    if type(getconnections) ~= "function" then return 0 end
+    local args = table.pack(...)
+    pcall(function()
+        for _, c in ipairs(getconnections(sig)) do
+            local f = c.Function
+            if f then
+                n += 1; task.spawn(pcall, f, table.unpack(args, 1, args.n))
+            elseif c.Fire then
+                n += 1; task.spawn(pcall, c.Fire, c, table.unpack(args, 1, args.n))
+            end
+        end
+    end)
+    return n
+end
+
+local function screenPoint(btn, gui)
+    local p, s = btn.AbsolutePosition, btn.AbsoluteSize
+    local x, y = p.X + s.X / 2, p.Y + s.Y / 2
+    if gui and gui:IsA("ScreenGui") and not gui.IgnoreGuiInset then y = y + GuiService:GetGuiInset().Y end
+    return x, y
+end
+
+-- กันคลิกพลาดไปโดนปุ่ม Roblox (แถบบนซ้าย): คืนพิกัดเฉพาะเมื่อปุ่มมองเห็นจริงและอยู่นอกแถบบน
+local function safePoint(b)
+    if not (b and b.Parent and b.Visible and b.AbsoluteSize.X > 4 and b.AbsoluteSize.Y > 4) then return end
+    local x, y = screenPoint(b, b:FindFirstAncestorOfClass("ScreenGui"))
+    local cam2 = workspace.CurrentCamera
+    local v = cam2 and cam2.ViewportSize
+    if y < 70 or x < 4 or (v and (x > v.X or y > v.Y)) then return end
+    return x, y
+end
+
+local function clickGui(b)
+    local n = 0
+    if type(getconnections) == "function" then
+        n = callConns(b.MouseButton1Click)
+        if n == 0 then n = callConns(b.Activated, fakeInput(Enum.UserInputState.Begin, 0, 0), 1) end
+    end
+    if n == 0 and VIM then
+        local x, y = safePoint(b)
+        if not x then return end
+        pcall(function()
+            VIM:SendMouseButtonEvent(x, y, 0, true, game, 0); task.wait(0.05)
+            VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        end)
+    end
+end
+
+-- ==================== สถานะตกปลา ====================
+local running = false
+local st, stSince, lastDone, token = "idle", os.clock(), 0, 0
+local caught, fishSinceSell = 0, 0
+local stats = {sold = 0, soldFish = 0, coinsEarned = 0, lastFish = 0, lastCoins = 0}
+local rodIdx, autoRod = 1, true
+local waterOf = {FoxRodSea = "sea"}
+local castPending, castAt = false, 0
+local failCount, streak = 0, 0
+local holding = false
+local function curRod() return ROD_ORDER[rodIdx] end
+
+local function applyRodSetting()
+    if S.fishRod == "auto" then
+        autoRod = true
+        local c = lp.Character
+        for i, r in ipairs(ROD_ORDER) do if c and c:FindFirstChild(r) then rodIdx = i end end
+    else
+        autoRod = false
+        local want = (S.fishRod == "sea") and "FoxRodSea" or "FoxRodFresh"
+        for i, r in ipairs(ROD_ORDER) do if r == want then rodIdx = i end end
+    end
+    failCount, streak = 0, 0
+end
+applyRodSetting()
+
+local function ensureRod()
+    local ROD = curRod()
+    local c = lp.Character; if not c then return false end
+    local h = c:FindFirstChildOfClass("Humanoid"); if not h or h.Health <= 0 then return false end
+    if c:FindFirstChild(ROD) then return true end
+    local bp = lp:FindFirstChild("Backpack")
+    local tool = bp and bp:FindFirstChild(ROD)
+    if not tool then
+        local bag = lp:FindFirstChild("FoxBag")
+        local inBag = bag and bag:FindFirstChild(ROD)
+        if inBag and BagAction then
+            BagAction:FireServer("take", inBag)
+            local t0 = os.clock()
+            while os.clock() - t0 < 3 and not tool do task.wait(0.1); tool = bp and bp:FindFirstChild(ROD) end
+        end
+    end
+    if tool then
+        pcall(function() h:EquipTool(tool) end)
+        task.wait(0.4)
+        return c:FindFirstChild(ROD) ~= nil
+    end
+    return false
+end
+
+local function switchRod(why)
+    if not autoRod then return end
+    rodIdx = rodIdx % #ROD_ORDER + 1
+    failCount = 0
+    setStatus("สลับเป็นเบ็ด" .. (ROD_NAME[curRod()] or curRod()) .. " (" .. why .. ")")
+end
+
+local function onFail(why, skipCancel)
+    failCount += 1; streak += 1
+    if not skipCancel then Remote:FireServer("cancel") end
+    st, stSince = "idle", os.clock()
+    lastDone = os.clock() + 1.5
+    if failCount >= CFG.FAIL_LIMIT and autoRod then switchRod(why) else setStatus(why) end
+    local cycleLen = CFG.FAIL_LIMIT * (autoRod and #ROD_ORDER or 1)
+    if streak % cycleLen == 0 then
+        lastDone = os.clock() + CFG.PAUSE_BOTH
+        setStatus("ตกไม่ได้ตรงนี้ — พัก " .. CFG.PAUSE_BOTH .. " วิ (เช็กว่ายืนที่น้ำและเบ็ดถูกชนิด)")
+    end
+end
+
+local function onWater(w)
+    if not w then return end
+    if not autoRod then streak, failCount = 0, 0 return end
+    local cur = curRod()
+    local other = ROD_ORDER[rodIdx % #ROD_ORDER + 1]
+    local mine = waterOf[cur]
+    if mine == nil and waterOf[other] ~= w then waterOf[cur] = w; mine = w end
+    if mine == w then streak, failCount = 0, 0 return end
+    if waterOf[other] == nil then waterOf[other] = w end
+    Remote:FireServer("cancel")
+    st, stSince, lastDone = "idle", os.clock(), os.clock() + 1.5
+    switchRod("น้ำ " .. tostring(w) .. " ไม่ตรงกับเบ็ด")
+end
+
+-- ==================== กดปุ่ม Action ====================
+local function actionButton()
+    local g = lp.PlayerGui:FindFirstChild("FoxFish")
+    local rc = g and g:FindFirstChild("RodControls")
+    return rc and rc:FindFirstChild("Action"), g
+end
+
+local MODES = {"signal", "touch", "mouse", "uis"}
+local modeIdx, locked = 1, false
+local holdSince, holdZc = nil, nil
+local inputLabel = MODES[modeIdx] .. "?"
+
+local function press(mode, v, btn, gui)
+    local x, y = screenPoint(btn, gui)
+    local state = v and Enum.UserInputState.Begin or Enum.UserInputState.End
+    if mode == "signal" then
+        local n = callConns(v and btn.InputBegan or btn.InputEnded, fakeInput(state, x, y), false)
+        n += callConns(v and btn.MouseButton1Down or btn.MouseButton1Up, x, y)
+        return n > 0
+    elseif mode == "touch" and VIM then
+        return pcall(function() VIM:SendTouchEvent(77, v and 0 or 2, x, y) end)
+    elseif mode == "mouse" and VIM then
+        return pcall(function() VIM:SendMouseButtonEvent(x, y, 0, v, game, 0) end)
+    elseif mode == "uis" then
+        return callConns(v and UIS.InputBegan or UIS.InputEnded, fakeInput(state, x, y), true) > 0
+    end
+    return false
+end
+
+local function setHold(v)
+    if v == holding then return end
+    local btn, gui = actionButton()
+    if not btn then return end
+    press(MODES[modeIdx], v, btn, gui)
+    holding = v
+    holdSince = v and os.clock() or nil
+    holdZc = nil
+end
+
+-- ==================== หา โซนเขียว / รูปปลา ====================
+local function isGreen(c)
+    local k = c.BackgroundColor3
+    return k.G >= k.R and k.G >= k.B
+end
+
+local function findReel()
+    local g = lp.PlayerGui:FindFirstChild("FoxFish")
+    local reel = g and g:FindFirstChild("Reel")
+    if not reel or not reel.Visible then return end
+    local fish
+    for _, d in ipairs(reel:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text:find("🐟") then fish = d; break end
+    end
+    if not fish then return end
+    local track = fish.Parent
+    local zone, fallback
+    for _, c in ipairs(track:GetChildren()) do
+        if c:IsA("Frame") and c.Visible and c.Name ~= "BossSky"
+           and c.AbsoluteSize.Y < track.AbsoluteSize.Y * 0.95
+           and c.AbsoluteSize.X <= track.AbsoluteSize.X then
+            if isGreen(c) then zone = c; break end
+            fallback = fallback or c
+        end
+    end
+    zone = zone or fallback
+    if zone then return fish, zone, track end
+end
+
+-- ==================== มินิเกม (คุมแถบ) ====================
+local fishObj, zoneObj, trackObj
+local lastZc, lastFc, lastT, svz, svf = nil, nil, nil, 0, 0
+conns[#conns + 1] = RunService.RenderStepped:Connect(function()
+    if not (alive and running and st == "reel") then
+        if holding then setHold(false) end
+        lastZc, lastFc, lastT = nil, nil, nil
+        return
+    end
+    if not (fishObj and fishObj.Parent and zoneObj and zoneObj.Parent) then
+        fishObj, zoneObj, trackObj = findReel()
+        lastZc, lastFc, lastT, svz, svf = nil, nil, nil, 0, 0
+        if not fishObj then return end
+    end
+    local now = os.clock()
+    local zc = zoneObj.AbsolutePosition.Y + zoneObj.AbsoluteSize.Y / 2
+    local fc = fishObj.AbsolutePosition.Y + fishObj.AbsoluteSize.Y / 2
+    if lastZc and lastT and now > lastT then
+        local dt = now - lastT
+        svz = svz * 0.6 + ((zc - lastZc) / dt) * 0.4     -- กรองความเร็วให้นิ่ง
+        svf = svf * 0.6 + ((fc - lastFc) / dt) * 0.4
+    end
+    lastZc, lastFc, lastT = zc, fc, now
+
+    if holding and holdSince and not locked then
+        if not holdZc then holdZc = zc end
+        local atTop = trackObj and (zoneObj.AbsolutePosition.Y <= trackObj.AbsolutePosition.Y + 4)
+        if holdZc - zc >= 6 then
+            locked = true
+            inputLabel = MODES[modeIdx] .. " ✓"
+        elseif now - holdSince > 0.5 and not atTop then
+            setHold(false)
+            modeIdx = modeIdx % #MODES + 1
+            inputLabel = MODES[modeIdx] .. "?"
+            return
+        end
+    end
+
+    -- ทำนายตำแหน่งปลาและโซนล่วงหน้า (y เพิ่ม = ลงล่าง) ปลาอยู่เหนือโซน -> กดยกโซนขึ้น
+    local err = (fc + svf * CFG.LOOKAHEAD) - (zc + svz * CFG.LOOKAHEAD)
+    if err < -CFG.DEADBAND then setHold(true) elseif err > CFG.DEADBAND then setHold(false) end
+end)
+
+-- ==================== รับสถานะจากเซิร์ฟเวอร์ ====================
+conns[#conns + 1] = Remote.OnClientEvent:Connect(function(kind, a, b)
+    if not alive then return end
+    if kind == "state" then
+        st, stSince = a, os.clock()
+        token += 1
+        local my = token
+        if a ~= "reel" then
+            fishObj, zoneObj, trackObj = nil, nil, nil
+            lastZc, lastFc, lastT = nil, nil, nil
+            setHold(false)
+        end
+        if a == "waiting" then
+            castPending = false
+            if running then onWater(type(b) == "table" and b.water or nil) end
+        elseif a == "bite" then
+            castPending = false
+            if running then
+                task.delay(rnd(CFG.HOOK_DELAY), function()
+                    if running and token == my and st == "bite" then Remote:FireServer("hook") end
+                end)
+            end
+        elseif a == "reel" then
+            castPending = false
+            fishObj, zoneObj, trackObj = nil, nil, nil
+            if running and S.fastReel and type(b) == "table" then   -- ทดลอง: ส่ง reel หลังเวลาขั้นต่ำ
+                local mt = tonumber(b.minTime) or 2.2
+                task.delay(mt + 0.3 + math.random() * 0.3, function()
+                    if running and token == my and st == "reel" then Remote:FireServer("reel", true) end
+                end)
+            end
+        elseif a == "idle" then
+            local base = os.clock() + rnd(CFG.RECAST_WAIT)
+            if castPending and running then
+                castPending = false
+                onFail("เซิร์ฟเวอร์ไม่รับการเหวี่ยง", true)
+                lastDone = math.max(lastDone, base)
+            else
+                lastDone = base
+            end
+        end
+    elseif kind == "caught" then
+        caught += 1; fishSinceSell += 1
+        streak, failCount = 0, 0
+    end
+end)
+
+local function fishRun(v)
+    running = v
+    if not v then setHold(false); castPending = false end
+    if v then lastDone = 0; failCount, streak = 0, 0 end
+end
+
+local function pauseFish()
+    fishRun(false)
+    Remote:FireServer("cancel")
+    local t0 = os.clock()
+    while os.clock() - t0 < 3 and st ~= "idle" do task.wait(0.1) end
+    st, stSince, castPending = "idle", os.clock(), false
+end
+
+local function resumeFish()
+    st, stSince, castPending = "idle", os.clock(), false
+    lastDone = os.clock() + 1
+    fishRun(true)
+end
+
+-- ลูปตกปลาหลัก
+task.spawn(function()
+    while alive do
+        task.wait(0.25)
+        if running then
+            local now = os.clock()
+            if st == "idle" and now >= lastDone then
+                if ensureRod() then
+                    st, stSince = "casting", now
+                    castPending, castAt = true, now
+                    Remote:FireServer("cast", CFG.CAST_MIN + math.random() * (CFG.CAST_MAX - CFG.CAST_MIN))
+                else
+                    onFail("ไม่พบ/ถือเบ็ด" .. (ROD_NAME[curRod()] or curRod()) .. " ไม่ได้", true)
+                    lastDone = math.max(lastDone, now + 2)
+                end
+            elseif castPending and (st == "casting" or st == "flying") and now - castAt > CFG.CAST_TIMEOUT then
+                castPending = false
+                onFail("เหวี่ยงแล้วไม่มีการตอบสนอง")
+            elseif st == "reel" and now - stSince > CFG.REEL_LIMIT then
+                setHold(false); Remote:FireServer("cancel")
+                st, stSince, lastDone = "idle", now, now + 1.5
+                setStatus("มินิเกมนานเกิน — ยกเลิก")
+            elseif st ~= "idle" and st ~= "reel" and not castPending and now - stSince > CFG.WATCHDOG then
+                Remote:FireServer("cancel")
+                st, stSince, lastDone = "idle", now, now + 1.5
+                setStatus("ค้าง — ยกเลิกแล้วเริ่มใหม่")
+            end
+        end
+    end
+end)
+
+-- ==================== เดินทาง (วาป / เดินไว) ====================
+local function warpTo(cf)
+    local r = root(); if not r then return false end
+    for _ = 1, 2 do
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end)
+        r.CFrame = cf
+        task.wait(0.05)
+    end
+    return true
+end
+
+local function walkTo(cf)
+    local h, r = hum(), root()
+    if not (h and r) then return end
+    local target = cf.Position
+    local old = h.WalkSpeed
+    h.WalkSpeed = CFG.WALK_SPEED
+    local t0 = os.clock()
+    local function moveTo(pos, limit)
+        local done = false
+        local c = h.MoveToFinished:Connect(function() done = true end)
+        h:MoveTo(pos)
+        local ts = os.clock()
+        local r0 = root()
+        local lastP, lastT = r0 and r0.Position, os.clock()
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        while not done and alive and os.clock() - ts < limit and os.clock() - t0 < CFG.WALK_TIMEOUT do
+            task.wait(0.05)
+            local rr = root()
+            if rr and (rr.Position - pos).Magnitude < 3 then break end
+            if rr then
+                -- เช็กกำแพง/สิ่งกีดขวางข้างหน้า -> กระโดด
+                local flat = Vector3.new(pos.X - rr.Position.X, 0, pos.Z - rr.Position.Z)
+                if flat.Magnitude > 1 then
+                    rp.FilterDescendantsInstances = {lp.Character}
+                    local hit = workspace:Raycast(rr.Position - Vector3.new(0, 1.5, 0), flat.Unit * 3.5, rp)
+                    if hit and hit.Instance.CanCollide then h.Jump = true end
+                end
+                -- ขยับน้อยมากเกิน 0.5 วิ = ติด -> กระโดด
+                local now = os.clock()
+                if now - lastT >= 0.5 then
+                    if lastP and (Vector3.new(rr.Position.X, 0, rr.Position.Z) - Vector3.new(lastP.X, 0, lastP.Z)).Magnitude < 1 then
+                        h.Jump = true
+                    end
+                    lastP, lastT = rr.Position, now
+                end
+            end
+        end
+        c:Disconnect()
+    end
+    pcall(function()
+        local path = PathfindingService:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true})
+        path:ComputeAsync(r.Position, target)
+        if path.Status == Enum.PathStatus.Success then
+            for _, wp in ipairs(path:GetWaypoints()) do
+                if not alive or os.clock() - t0 > CFG.WALK_TIMEOUT then break end
+                if wp.Action == Enum.PathWaypointAction.Jump then h.Jump = true end
+                moveTo(wp.Position, 2.5)
+            end
+        else
+            moveTo(target, 12)
+        end
+    end)
+    pcall(function() h.WalkSpeed = old end)
+end
+
+-- snap=true: ปรับตำแหน่ง+ทิศหันให้ตรงกับ cf เป๊ะ (ใช้กับจุดฟาม)
+local function travel(cf, snap)
+    if not root() then return false end
+    if S.mode == "walk" then
+        walkTo(cf)
+        local r = root()
+        if r and (r.Position - cf.Position).Magnitude > 8 then warpTo(cf) end
+        if snap then warpTo(cf) end
+    else
+        warpTo(cf)
+    end
+    return true
+end
+
+-- ==================== กระเป๋า / เหรียญ ====================
+local function bagLabel()
+    local g = lp.PlayerGui:FindFirstChild("FoxFish")
+    local top = g and g:FindFirstChild("Top")
+    local b = top and top:FindFirstChild("FishBag")
+    local l = b and b:FindFirstChild("TextLabel")
+    if l and l:IsA("TextLabel") then
+        local c, m = l.Text:match("(%d+)%s*/%s*(%d+)")
+        if c then return tonumber(c), tonumber(m) end
+    end
+end
+
+local function readCoins()
+    local g = lp.PlayerGui:FindFirstChild("FoxFish")
+    local top = g and g:FindFirstChild("Top")
+    local c = top and top:FindFirstChild("Coins")
+    local l = c and c:FindFirstChild("TextLabel")
+    if l and l:IsA("TextLabel") then return tonumber((l.Text:gsub("[^%d]", ""))) end
+end
+
+local function countFish(res, seen, depth)
+    seen, depth = seen or {}, depth or 0
+    if type(res) ~= "table" or seen[res] or depth > 6 then return 0 end
+    seen[res] = true
+    local id = res.u or res.uid or res.id
+    local sp = res.s or res.species or res.name or res.fish
+    if id ~= nil and sp ~= nil then return 1 end
+    local n = 0
+    for _, v in pairs(res) do n += countFish(v, seen, depth + 1) end
+    return n
+end
+
+local function bagCountRemote()
+    local ok, res = pcall(function() return Req:InvokeServer("bag") end)
+    if ok then return countFish(res) end
+end
+
+local function bagNearFull()
+    local c, m = bagLabel()
+    if c and m then return c >= m - CFG.SELL_MARGIN end
+    return fishSinceSell >= CFG.FALLBACK_MAX - CFG.SELL_MARGIN
+end
+
+-- ==================== ปุ่มโต้ตอบ (FoxPrompt) / หน้าร้าน ====================
+local function promptButton()
+    local g = lp.PlayerGui:FindFirstChild("FoxPrompt")
+    local f = g and g:FindFirstChild("Frame")
+    local b = f and f:FindFirstChild("TextButton")
+    if b and f.Visible and b.Visible and g.Enabled ~= false then return b end
+end
+
+local function nearestPrompt(pos, maxDist)
+    local best, bd
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local p = d.Parent
+            local part = p and (p:IsA("BasePart") and p or (p:IsA("Attachment") and p.Parent)
+                or p:FindFirstChildWhichIsA("BasePart", true))
+            if part and part:IsA("BasePart") then
+                local dist = (part.Position - pos).Magnitude
+                if dist < maxDist and (not bd or dist < bd) then best, bd = d, dist end
+            end
+        end
+    end
+    return best
+end
+
+-- กดปุ่มโต้ตอบ (FoxPrompt) ให้ "เปิดร้านจริง" — ลองทีละวิธีแล้วเช็กด้วย verify() ว่าเปิดแล้วหรือยัง
+local function usePrompt(pos, timeout, verify)
+    if verify() then return true end
+    local t0, btn = os.clock(), nil
+    while os.clock() - t0 < timeout do
+        btn = promptButton()
+        if btn then break end
+        task.wait(0.1)
+    end
+    local tries = {}
+    tries[1] = function()   -- ลอง ProximityPrompt ก่อน (ไม่ต้องคลิกจอ)
+        local p = nearestPrompt(pos, 25)
+        if p and type(fireproximityprompt) == "function" then
+            p.HoldDuration = 0
+            fireproximityprompt(p)
+        end
+    end
+    if btn then
+        local x, y = screenPoint(btn, btn:FindFirstAncestorOfClass("ScreenGui"))
+        tries[#tries + 1] = function() clickGui(btn) end
+        tries[#tries + 1] = function()   -- ปุ่มโต้ตอบแบบกด: InputBegan -> InputEnded
+            callConns(btn.InputBegan, fakeInput(Enum.UserInputState.Begin, x, y), false)
+            task.wait(0.15)
+            callConns(btn.InputEnded, fakeInput(Enum.UserInputState.End, x, y), false)
+        end
+        if VIM and safePoint(btn) then
+            tries[#tries + 1] = function()
+                VIM:SendMouseButtonEvent(x, y, 0, true, game, 0); task.wait(0.12)
+                VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+            end
+            tries[#tries + 1] = function()
+                VIM:SendTouchEvent(88, 0, x, y); task.wait(0.12)
+                VIM:SendTouchEvent(88, 2, x, y)
+            end
+        end
+    end
+    for _, fn in ipairs(tries) do
+        pcall(fn)
+        local t1 = os.clock()
+        while os.clock() - t1 < 1.0 do
+            task.wait(0.1)
+            if verify() then return true end
+        end
+    end
+    return verify()
+end
+
+local function fishBagParts()
+    local g = lp.PlayerGui:FindFirstChild("FoxFish")
+    local fb = g and g:FindFirstChild("FishBag")
+    local content = fb and fb:FindFirstChild("FishContent")
+    local fr = content and content:FindFirstChild("Frame")
+    return fb, fr and fr:FindFirstChild("TextButton"), fb and fb:FindFirstChild("ImageButton")
+end
+
+-- ร้านเปิดอยู่ไหม: เกมตั้งแอตทริบิวต์ FoxFishShopMode บนผู้เล่น และหัวหน้ากระเป๋าเปลี่ยนเป็น "ศูนย์ตกปลา..."
+local function shopOpen()
+    if lp:GetAttribute("FoxFishShopMode") ~= nil then return true end
+    local g = lp.PlayerGui:FindFirstChild("FoxFish")
+    local fb = g and g:FindFirstChild("FishBag")
+    local rb = fb and fb:FindFirstChild("Ribbon")
+    local l = rb and rb:FindFirstChild("TextLabel")
+    return l ~= nil and l:IsA("TextLabel") and l.Text:find("ศูนย์") ~= nil
+end
+
+-- ==================== ขาย ====================
+-- จากรายงาน WFR: กดปุ่ม FoxPrompt -> เซิร์ฟเวอร์ส่ง Remote("shop","fresh") -> กระเป๋าเปลี่ยนเป็นหน้าร้าน
+-- -> กดปุ่ม FishContent.Frame.TextButton (ขาย) -> InvokeServer("sellAll") -> กด ImageButton ปิด
+local lastSellFail = 0
+local shopEventAt = 0
+conns[#conns + 1] = Remote.OnClientEvent:Connect(function(kind)
+    if kind == "shop" then shopEventAt = os.clock() end
+end)
+
+local function nearestSell(pos)
+    local best, bd
+    for _, v in ipairs(CFG.SELL_SPOTS) do
+        local d = (v - pos).Magnitude
+        if not bd or d < bd then best, bd = v, d end
+    end
+    return best
+end
+
+local function sellBtnReady()
+    local fb, sellBtn = fishBagParts()
+    local ready = fb ~= nil and fb.Visible and sellBtn ~= nil and sellBtn.Visible
+    return ready, sellBtn
+end
+
+-- สรุปผลการขาย: นับตัว/เงิน/อัปเดตสถานะ
+local function recordSale(before, after, coins0)
+    local soldN = (before and after) and (before - after) or 0
+    local gained = 0
+    if soldN > 0 and coins0 then
+        local c1, t2 = readCoins(), os.clock()
+        while c1 and c1 <= coins0 and os.clock() - t2 < 2 do task.wait(0.2); c1 = readCoins() end
+        if c1 then gained = math.max(0, c1 - coins0) end
+    end
+    stats.sold += 1; stats.soldFish += soldN; stats.coinsEarned += gained
+    stats.lastFish, stats.lastCoins = soldN, gained
+    fishSinceSell = 0; lastSellFail = 0
+    local c, m = bagLabel()
+    setStatus("ขายแล้ว " .. soldN .. " ตัว +" .. gained .. " เหรียญ ✓" .. (c and (" | กระเป๋า " .. c .. "/" .. tostring(m)) or ""))
+end
+
+-- ขายจากกระเป๋าโดยไม่ต้องไปร้าน (ฟีเจอร์เกมพาสของเกม — ใช้ได้เฉพาะคนที่มีเกมพาส)
+local passDisabled = false
+local function bagSellButton()
+    local g = lp.PlayerGui:FindFirstChild("FoxHUD")
+    local bag = g and g:FindFirstChild("Bag")
+    local eh = bag and bag:FindFirstChild("EmbedHolder")
+    local fc = eh and eh:FindFirstChild("FishContent")
+    local fr = fc and fc:FindFirstChild("Frame")
+    return fr and fr:FindFirstChild("TextButton")
+end
+
+-- จากรายงาน WFR10_144238: กดปุ่มในกระเป๋า 1 รอบ = เรียกไรเดอร์ (FoxRiderClient.Call)
+-- คนไม่มีเกมพาสจะมี BindableEvent ReplicatedStorage.FoxShopDetail.Open ยิงตามมา (หน้าต่างให้ซื้อเกมพาส)
+local shopDetailAt = 0
+local lastRiderCall = 0
+do
+    local sd = RS:FindFirstChild("FoxShopDetail")
+    local ev = sd and sd:FindFirstChild("Open")
+    if ev and ev:IsA("BindableEvent") then
+        conns[#conns + 1] = ev.Event:Connect(function() shopDetailAt = os.clock() end)
+    end
+end
+
+local function closePurchasePopup()
+    local g = lp.PlayerGui:FindFirstChild("FoxShopDetail")
+    local f = g and g:FindFirstChild("Frame")
+    local x = f and f:FindFirstChild("ImageButton")
+    if x then clickGui(x) end
+end
+
+local function settleBag(before)
+    local after, last, same, t1 = before, nil, 0, os.clock()
+    while os.clock() - t1 < 5 do
+        task.wait(0.5)
+        local n = bagCountRemote()
+        if n == nil then break end
+        after = n
+        if n == 0 then break end
+        if n == last then same += 1 else same = 0 end
+        last = n
+        if same >= 2 then break end
+    end
+    return after
+end
+
+local function sellInPlace()
+    local before = bagCountRemote()
+    if before == 0 then setStatus("กระเป๋าว่าง ไม่ต้องขาย") return true end
+    if before == nil then return false end
+    local coins0 = readCoins()
+    for attempt = 1, 2 do
+        if attempt == 1 then
+            -- วิธีเดียวกับที่กดเอง: กด 1 รอบ (เรียกไรเดอร์) รอ 3-4 วิ แล้วกดที่เดิมอีก 1 รอบ (ขาย)
+            local btn = bagSellButton()
+            if btn then
+                local cd = 30 - (os.clock() - lastRiderCall)   -- เรียกไรเดอร์ได้ทุก 30 วิ
+                if cd > 0 then
+                    setStatus("รอคูลดาวน์ไรเดอร์ " .. math.ceil(cd) .. " วิ...")
+                    task.wait(cd)
+                end
+                local t0 = os.clock()
+                lastRiderCall = t0
+                setStatus("ขายจากกระเป๋า: กดรอบที่ 1 (เรียกไรเดอร์)...")
+                clickGui(btn)
+                task.wait(0.8)
+                if shopDetailAt >= t0 then   -- เด้งหน้าซื้อเกมพาส = ไม่มีเกมพาส
+                    closePurchasePopup()
+                    passDisabled = true
+                    setStatus("ไม่มีเกมพาส (เด้งหน้าซื้อ) — ปิดแล้ว ไปขายที่ร้านแทน")
+                    return false
+                end
+                local w = 2.2 + math.random()
+                setStatus("รอไรเดอร์มา " .. string.format("%.1f", w + 0.8) .. " วิ แล้วกดรอบที่ 2...")
+                task.wait(w)
+                btn = bagSellButton() or btn
+                clickGui(btn)
+                task.wait(0.5)
+                if shopDetailAt >= t0 then closePurchasePopup() end
+            end
+        else
+            setStatus("ขายจากกระเป๋า (รีโมต)...")
+            pcall(function() return Req:InvokeServer("sellAll") end)
+        end
+        local after = settleBag(before)
+        if after and after < before then
+            recordSale(before, after, coins0)
+            return true
+        end
+    end
+    return false
+end
+
+local function unequipRod()
+    local h = hum()
+    if h then pcall(function() h:UnequipTools() end) end
+end
+
+-- ขาย: เลิกถือเบ็ด -> ไปจุดขาย -> เปิดร้าน -> ยิง sellAll แล้วรอจนจำนวนปลานิ่ง -> สรุปผล -> ปิดร้าน
+local function sellStep()
+    local r = root(); if not r then return false end
+    unequipRod()
+    local spot = nearestSell(r.Position)
+    local idx = 1
+    for i, v in ipairs(CFG.SELL_SPOTS) do if v == spot then idx = i end end
+    setStatus("ไปจุดขายที่ใกล้สุด (จุด " .. idx .. "/" .. #CFG.SELL_SPOTS .. ", ห่าง " .. math.floor((spot - r.Position).Magnitude) .. " หน่วย)...")
+    travel(CFrame.new(spot), false)
+    task.wait(CFG.WARP_WAIT)
+    unequipRod()
+    local before = bagCountRemote()
+    if before == 0 then setStatus("กระเป๋าว่าง ไม่ต้องขาย") return true end
+    local coins0 = readCoins()
+
+    -- 1) กดเปิดร้านค้า (ลองสูงสุด 3 รอบ) — นับว่าเปิดแล้วเมื่อเซิร์ฟเวอร์ส่ง "shop" หรือหน้าร้านขึ้น
+    local opened = false
+    for i = 1, 3 do
+        setStatus("กดเปิดร้านค้า... (" .. i .. "/3)")
+        local t0 = os.clock()
+        opened = usePrompt(spot, 3, function() return shopEventAt >= t0 or shopOpen() end)
+        if opened then break end
+        task.wait(0.5)
+    end
+
+    -- 2) ขายด้วยรีโมต sellAll แล้ว "รอจนขายเสร็จ" (จำนวนปลานิ่ง) ลองสูงสุด 4 รอบ
+    if opened then task.wait(0.5) end
+    local ok, after = false, before
+    for attempt = 1, 4 do
+        setStatus("สั่งขาย (รีโมต) " .. attempt .. "/4...")
+        pcall(function() return Req:InvokeServer("sellAll") end)
+        local last, same, t1 = nil, 0, os.clock()
+        while os.clock() - t1 < 6 do
+            task.wait(0.5)
+            local n = bagCountRemote()
+            if n == nil then break end
+            after = n
+            if n == 0 then break end
+            if n == last then same += 1 else same = 0 end
+            last = n
+            if same >= 2 then break end
+        end
+        if before == nil or after == nil or after < before then ok = true break end
+    end
+
+    -- 3) สรุปผล
+    if ok then
+        recordSale(before, after, coins0)
+    else
+        lastSellFail = os.clock()
+        setStatus(opened and "ขายไม่สำเร็จ — เปิดร้านแล้วแต่จำนวนปลาไม่ลด"
+            or "เปิดร้านไม่ได้ — ปุ่มโต้ตอบไม่ขึ้น/กดไม่ติด (ยืนใกล้ร้านไหม)")
+    end
+
+    -- 4) ปิดหน้าร้าน (หลังขายเสร็จเท่านั้น)
+    if shopOpen() or sellBtnReady() then
+        local _, _, closeBtn = fishBagParts()
+        if closeBtn then clickGui(closeBtn); task.wait(0.3) end
+    end
+    return ok
+end
+
+-- ==================== ฟาม ====================
+local farmOn, busy = false, false
+local home, startAt = nil, 0
+
+local function spotCF()
+    for _, sp in ipairs(spots) do
+        if sp.name == S.spotName and type(sp.c) == "table" and #sp.c == 12 then
+            return CFrame.new(table.unpack(sp.c))
+        end
+    end
+end
+
+local function cycle()
+    local r = root(); if not r then return end
+    if S.sellMode == "pass" and not passDisabled then
+        if sellInPlace() then return end
+        passDisabled = true
+        setStatus("ขายจากกระเป๋าไม่ได้ (ไม่มีเกมพาส?) — ไปขายที่ร้านแทน")
+        task.wait(1)
+    end
+    local back = home or r.CFrame
+    pauseFish()
+    -- รอจนขายเสร็จจริง (ลองซ้ำสูงสุด 3 ครั้ง) แล้วค่อยวาปกลับจุดฟาม
+    for i = 1, 3 do
+        if sellStep() then break end
+        if i < 3 then setStatus("ขายไม่สำเร็จ — ลองใหม่ (" .. i .. "/3)"); task.wait(1.5) end
+    end
+    task.wait(0.5)
+    setStatus("กลับจุดฟาม...")
+    travel(back, true)
+    if farmOn then resumeFish(); setStatus("ฟามต่อ") end
+end
+
+local function farmTick()
+    local r = root(); if not r then return end
+    if home and (r.Position - home.Position).Magnitude > 10 then
+        pauseFish()
+        setStatus("ไปจุดฟาม...")
+        travel(home, true)
+        resumeFish()
+        return
+    end
+    if not running then resumeFish() end
+    if S.autoSell and os.clock() - lastSellFail > 30 and bagNearFull() then
+        cycle()
+    end
+end
+
+task.spawn(function()
+    while alive do
+        task.wait(0.4)
+        if farmOn and not busy then
+            busy = true
+            local ok, err = pcall(farmTick)
+            if not ok then setStatus("ผิดพลาด: " .. tostring(err)) end
+            busy = false
+        end
+    end
+end)
+
+local function manual()
+    if busy then setStatus("กำลังทำงานอยู่ รอสักครู่") return end
+    busy = true
+    local ok, err = pcall(cycle)
+    if not ok then setStatus("ผิดพลาด: " .. tostring(err)) end
+    busy = false
+end
+
+-- ==================== UI (แดง-ดำ) ====================
+local C = {
+    bg = Color3.fromRGB(10, 10, 13), panel = Color3.fromRGB(20, 20, 26), panel2 = Color3.fromRGB(30, 30, 38),
+    line = Color3.fromRGB(52, 52, 64), red = Color3.fromRGB(232, 40, 58), red2 = Color3.fromRGB(120, 14, 26),
+    text = Color3.fromRGB(240, 240, 246), sub = Color3.fromRGB(150, 150, 168), off = Color3.fromRGB(58, 58, 70),
+    green = Color3.fromRGB(70, 200, 120),
+}
+local function mk(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function corner(o, r) return mk("UICorner", {CornerRadius = UDim.new(0, r or 8)}, o) end
+local function stroke(o, col, th) return mk("UIStroke", {Color = col, Thickness = th or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, o) end
+
+local parent = (type(gethui) == "function" and gethui()) or lp:WaitForChild("PlayerGui")
+local oldUi = parent:FindFirstChild("AutoFarmHubUI"); if oldUi then oldUi:Destroy() end
+local sg = mk("ScreenGui", {Name = "AutoFarmHubUI", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling}, parent)
+
+local cam = workspace.CurrentCamera
+local vp = cam and cam.ViewportSize or Vector2.new(800, 450)
+local W, H = 330, math.min(480, vp.Y - 30)
+local win = mk("Frame", {Name = "Win", Size = UDim2.fromOffset(W, H), Position = UDim2.new(0, 12, 0.5, -H / 2),
+    BackgroundColor3 = C.bg, BorderSizePixel = 0, ClipsDescendants = true}, sg)
+corner(win, 12); stroke(win, C.red, 1.5)
+
+local header = mk("Frame", {Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = C.red2, BorderSizePixel = 0}, win)
+mk("UIGradient", {Color = ColorSequence.new(Color3.fromRGB(190, 24, 40), Color3.fromRGB(22, 5, 8)), Rotation = 0}, header)
+mk("TextLabel", {Size = UDim2.new(1, -90, 0, 24), Position = UDim2.fromOffset(14, 5), BackgroundTransparency = 1,
+    Text = "AUTO FARM", TextColor3 = C.text, TextSize = 18, Font = Enum.Font.GothamBlack,
+    TextXAlignment = Enum.TextXAlignment.Left}, header)
+mk("TextLabel", {Size = UDim2.new(1, -90, 0, 14), Position = UDim2.fromOffset(14, 28), BackgroundTransparency = 1,
+    Text = "FOXFISH  •  ตก · ขาย", TextColor3 = Color3.fromRGB(255, 200, 205), TextSize = 10,
+    Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left}, header)
+local minB = mk("TextButton", {Size = UDim2.fromOffset(28, 26), Position = UDim2.new(1, -66, 0, 10), BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+    BackgroundTransparency = 0.6, Text = "–", TextColor3 = C.text, TextSize = 16, Font = Enum.Font.GothamBold, BorderSizePixel = 0}, header)
+corner(minB, 7)
+local xB = mk("TextButton", {Size = UDim2.fromOffset(28, 26), Position = UDim2.new(1, -34, 0, 10), BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+    BackgroundTransparency = 0.6, Text = "✕", TextColor3 = C.text, TextSize = 12, Font = Enum.Font.GothamBold, BorderSizePixel = 0}, header)
+corner(xB, 7)
+
+local body = mk("ScrollingFrame", {Size = UDim2.new(1, 0, 1, -50), Position = UDim2.fromOffset(0, 48), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = C.red, CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y}, win)
+mk("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, body)
+mk("UIPadding", {PaddingTop = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10)}, body)
+
+local ordN = 0
+local function ord() ordN += 1; return ordN end
+
+do -- ลาก
+    local drag, ds, dp
+    conns[#conns + 1] = header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            drag, ds, dp = true, i.Position, win.Position end
+    end)
+    conns[#conns + 1] = UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then drag = false end
+    end)
+    conns[#conns + 1] = UIS.InputChanged:Connect(function(i)
+        if drag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - ds
+            win.Position = UDim2.new(dp.X.Scale, dp.X.Offset + d.X, dp.Y.Scale, dp.Y.Offset + d.Y)
+        end
+    end)
+end
+
+local function section(text)
+    local f = mk("Frame", {Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, LayoutOrder = ord()}, body)
+    mk("Frame", {Size = UDim2.fromOffset(3, 14), Position = UDim2.fromOffset(0, 4), BackgroundColor3 = C.red, BorderSizePixel = 0}, f)
+    mk("TextLabel", {Size = UDim2.new(1, -10, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1, Text = text,
+        TextColor3 = C.text, TextSize = 12, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, f)
+end
+
+local function toggle(text, init, cb)
+    local row = mk("Frame", {Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = C.panel, BorderSizePixel = 0, LayoutOrder = ord()}, body)
+    corner(row, 8); stroke(row, C.line, 1)
+    mk("TextLabel", {Size = UDim2.new(1, -66, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1, Text = text,
+        TextColor3 = C.text, TextSize = 12, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true}, row)
+    local track = mk("Frame", {Size = UDim2.fromOffset(40, 20), Position = UDim2.new(1, -50, 0.5, -10), BackgroundColor3 = C.off, BorderSizePixel = 0}, row)
+    corner(track, 10)
+    local knob = mk("Frame", {Size = UDim2.fromOffset(16, 16), Position = UDim2.fromOffset(2, 2), BackgroundColor3 = C.text, BorderSizePixel = 0}, track)
+    corner(knob, 8)
+    local state = init and true or false
+    local function paint()
+        track.BackgroundColor3 = state and C.red or C.off
+        knob.Position = state and UDim2.fromOffset(22, 2) or UDim2.fromOffset(2, 2)
+    end
+    paint()
+    local hit = mk("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = ""}, row)
+    hit.MouseButton1Click:Connect(function() state = not state; paint(); cb(state) end)
+end
+
+local function dropdown(title, options, selKey, cb)
+    local box = mk("Frame", {Size = UDim2.new(1, 0, 0, 36), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.panel,
+        BorderSizePixel = 0, LayoutOrder = ord()}, body)
+    corner(box, 8); stroke(box, C.line, 1)
+    mk("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder}, box)
+    local head = mk("TextButton", {Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1, Text = "", LayoutOrder = 1}, box)
+    mk("TextLabel", {Size = UDim2.new(0.42, 0, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1, Text = title,
+        TextColor3 = C.sub, TextSize = 11, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left}, head)
+    local val = mk("TextLabel", {Size = UDim2.new(0.58, -26, 1, 0), Position = UDim2.new(0.42, 0, 0, 0), BackgroundTransparency = 1, Text = "",
+        TextColor3 = C.red, TextSize = 12, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd}, head)
+    mk("TextLabel", {Size = UDim2.fromOffset(18, 36), Position = UDim2.new(1, -20, 0, 0), BackgroundTransparency = 1, Text = "▾",
+        TextColor3 = C.sub, TextSize = 12, Font = Enum.Font.GothamBold}, head)
+    local list = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+        Visible = false, LayoutOrder = 2}, box)
+    mk("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder}, list)
+    local obj = {}
+    local opts, sel = options, selKey
+    local function labelOf(k)
+        for _, o in ipairs(opts) do if o.key == k then return o.label end end
+        return "—"
+    end
+    local function rebuild()
+        for _, c in ipairs(list:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+        for i, o in ipairs(opts) do
+            local b = mk("TextButton", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.panel2, BorderSizePixel = 0, Text = "   " .. o.label,
+                TextColor3 = (o.key == sel) and C.red or C.text, TextSize = 12, Font = Enum.Font.GothamMedium,
+                TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = i}, list)
+            b.MouseButton1Click:Connect(function()
+                sel = o.key; val.Text = o.label; list.Visible = false; rebuild(); cb(o.key)
+            end)
+        end
+        val.Text = labelOf(sel)
+    end
+    function obj.setOptions(o, s) opts = o; sel = s; rebuild() end
+    head.MouseButton1Click:Connect(function() list.Visible = not list.Visible end)
+    rebuild()
+    return obj
+end
+
+local function btnRow(items, h)
+    local row = mk("Frame", {Size = UDim2.new(1, 0, 0, h or 34), BackgroundTransparency = 1, LayoutOrder = ord()}, body)
+    local n, made = #items, {}
+    for i, it in ipairs(items) do
+        local b = mk("TextButton", {Size = UDim2.new(1 / n, -4, 1, 0), Position = UDim2.new((i - 1) / n, 2, 0, 0), BackgroundColor3 = it[2],
+            Text = it[1], TextColor3 = C.text, TextSize = 12, Font = Enum.Font.GothamBold, BorderSizePixel = 0}, row)
+        corner(b, 8)
+        b.MouseButton1Click:Connect(it[3])
+        made[i] = b
+    end
+    return made
+end
+
+-- การ์ดสถานะ
+local card = mk("Frame", {Size = UDim2.new(1, 0, 0, 112), BackgroundColor3 = C.panel, BorderSizePixel = 0, LayoutOrder = ord()}, body)
+corner(card, 10); stroke(card, C.red2, 1.2)
+mk("Frame", {Size = UDim2.fromOffset(4, 112), BackgroundColor3 = C.red, BorderSizePixel = 0}, card)
+statusLbl = mk("TextLabel", {Size = UDim2.new(1, -22, 0, 30), Position = UDim2.fromOffset(14, 6), BackgroundTransparency = 1, Text = statusMsg,
+    TextColor3 = C.text, TextSize = 13, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true}, card)
+statLbl = mk("TextLabel", {Size = UDim2.new(1, -22, 0, 72), Position = UDim2.fromOffset(14, 38), BackgroundTransparency = 1, Text = "",
+    TextColor3 = C.sub, TextSize = 10, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true}, card)
+
+-- ฟาม
+section("FARM  •  จุดฟาม")
+local ddSpot
+local function spotOptions()
+    local o = {{key = "", label = "ตกตรงที่ยืน"}}
+    for _, sp in ipairs(spots) do o[#o + 1] = {key = sp.name, label = sp.name} end
+    return o
+end
+ddSpot = dropdown("จุดฟาม", spotOptions(), S.spotName, function(k) S.spotName = k; saveAll() end)
+btnRow({
+    {"📍 บันทึกจุดนี้", C.panel2, function()
+        local r = root(); if not r then setStatus("ไม่พบตัวละคร") return end
+        local n = 1
+        local function taken(nm) for _, sp in ipairs(spots) do if sp.name == nm then return true end end end
+        while taken("จุด " .. n) do n += 1 end
+        local name = "จุด " .. n
+        spots[#spots + 1] = {name = name, c = {r.CFrame:GetComponents()}}
+        S.spotName = name; saveAll()
+        ddSpot.setOptions(spotOptions(), name)
+        setStatus("บันทึก " .. name .. " (ตำแหน่ง+ทิศหัน)")
+    end},
+    {"🗑 ลบจุดที่เลือก", C.red2, function()
+        for i, sp in ipairs(spots) do
+            if sp.name == S.spotName then table.remove(spots, i) break end
+        end
+        S.spotName = ""; saveAll()
+        ddSpot.setOptions(spotOptions(), "")
+        setStatus("ลบจุดแล้ว")
+    end},
+})
+dropdown("โหมดเดินทาง", {{key = "warp", label = "⚡ วาป"}, {key = "walk", label = "🏃 เดินไว"}}, S.mode,
+    function(k) S.mode = k; saveAll() end)
+
+local startRow
+local function paintStart()
+    local b = startRow[1]
+    b.Text = farmOn and "■ หยุดฟาม" or "▶ เริ่มฟาม"
+    b.BackgroundColor3 = farmOn and C.red2 or C.red
+end
+local function setFarm(v)
+    if v == farmOn then return end
+    if v then
+        local r = root(); if not r then setStatus("ไม่พบตัวละคร") return end
+        local cf = spotCF()
+        home = cf or r.CFrame
+        startAt = os.clock()
+        farmOn = true
+        setStatus(cf and "เริ่มฟาม — ไปจุดฟาม" or "เริ่มฟาม (ตกตรงที่ยืน)")
+    else
+        farmOn = false
+        home = nil
+        paintStart()
+        pauseFish()
+        setStatus("หยุดฟามแล้ว")
+    end
+    paintStart()
+end
+startRow = btnRow({{"▶ เริ่มฟาม", C.red, function() setFarm(not farmOn) end}}, 40)
+
+-- ตกปลา
+section("FISH  •  ตกปลา")
+dropdown("เบ็ดที่ใช้ตก", {{key = "auto", label = "🔁 อัตโนมัติ"}, {key = "fresh", label = "🎣 น้ำจืด"}, {key = "sea", label = "🌊 ทะเล"}},
+    S.fishRod, function(k) S.fishRod = k; saveAll(); applyRodSetting() end)
+toggle("⚡ ข้ามมินิเกม (ทดลอง)", S.fastReel, function(v) S.fastReel = v; saveAll() end)
+
+-- ขาย
+section("SELL  •  ขายปลา")
+toggle("ขายอัตโนมัติเมื่อกระเป๋าเต็ม", S.autoSell, function(v) S.autoSell = v; saveAll() end)
+dropdown("วิธีขาย", {{key = "shop", label = "🏪 ร้านค้า (วาปไปขาย)"}, {key = "pass", label = "🎫 เกมพาส (ไรเดอร์ขายจากกระเป๋า)"}},
+    S.sellMode, function(k) S.sellMode = k; passDisabled = false; saveAll() end)
+btnRow({{"💰 ขายตอนนี้", C.panel2, function() task.spawn(manual) end}})
+
+-- อัปเดตสถานะ
+local function fmtTime(s)
+    s = math.floor(s)
+    return string.format("%02d:%02d:%02d", s // 3600, (s % 3600) // 60, s % 60)
+end
+task.spawn(function()
+    while alive do
+        task.wait(0.5)
+        local c, m = bagLabel()
+        local coins = readCoins()
+        statLbl.Text = string.format(
+            "🐟 ตกได้ %d ตัว | 📦 ขายแล้ว %d ตัว (%d รอบ)\n💰 ได้เงิน +%d (รอบล่าสุด %d ตัว +%d) | เหรียญ %s\n🎒 กระเป๋า %s | เบ็ด %s | ⏱ %s\n%s",
+            caught, stats.soldFish, stats.sold, stats.coinsEarned, stats.lastFish, stats.lastCoins,
+            coins and tostring(coins) or "?", c and (c .. "/" .. tostring(m)) or "?",
+            ROD_NAME[curRod()] or "?", farmOn and fmtTime(os.clock() - startAt) or "--:--:--",
+            st .. " · กด:" .. inputLabel)
+    end
+end)
+
+-- ย่อ/ปิด
+local collapsed = false
+minB.MouseButton1Click:Connect(function()
+    collapsed = not collapsed
+    body.Visible = not collapsed
+    win.Size = collapsed and UDim2.fromOffset(W, 46) or UDim2.fromOffset(W, H)
+end)
+
+local function kill()
+    alive, farmOn, running = false, false, false
+    pcall(setHold, false)
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    pcall(function() sg:Destroy() end)
+end
+ENV.__AFH_KILL = kill
+xB.MouseButton1Click:Connect(kill)
+
+setStatus("พร้อม — เลือกจุดฟาม แล้วกดเริ่มฟาม")
