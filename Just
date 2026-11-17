@@ -32,7 +32,7 @@ local running = true -- สคริปต์ยังทำงานอยู�
 
 -- ===================== ค่าคงที่ (ปรับได้) =====================
 local CFG = {
-	ROD_NAME = "fishing_rod",  -- ชื่อ Tool ในมือตอนถือเบ็ด
+	ROD_NAME = "",             -- บังคับชื่อเบ็ด (เว้นว่าง = ใช้ได้ทุกเบ็ด: fishing_rod, rod_xxx และชื่อที่มีคำว่า rod)
 	PRESS_MODE = "input",      -- วิธีกด "ดึง!": "input" (InputBegan), "activated", "space"
 	MIN_DT = 0.5,              -- ระยะห่างขั้นต่ำก่อนกดแต่ละรอบ (วินาที) กัน MIN_GAP ของเกม
 	T0_OFFSET = 0.016,         -- เกมเริ่มนับเวลาหลังเราได้รับ challenge ประมาณนี้ (วัดจาก log)
@@ -96,6 +96,7 @@ local S = {
 	antiAfk = true,
 	autoRejoin = true,
 	home = nil, -- { x, y, z, lx, lz } จุดตกปลาและทิศที่หัน
+	rodId = nil, -- เบ็ดที่ถือล่าสุด (จำเองเมื่อถือเบ็ด ใช้ถือใหม่หลังตาย/ซื้อขาย)
 }
 
 local function clamp(n, lo, hi)
@@ -137,6 +138,7 @@ local function saveSettings()
 		"returnHome=" .. (S.returnHome and "1" or "0"),
 		"antiAfk=" .. (S.antiAfk and "1" or "0"),
 		"autoRejoin=" .. (S.autoRejoin and "1" or "0"),
+		"rodId=" .. (S.rodId or ""),
 		"home=" .. (S.home and string.format("%.3f,%.3f,%.3f,%.4f,%.4f", S.home.x, S.home.y, S.home.z, S.home.lx, S.home.lz) or ""),
 	}, "\n")
 	pcall(writefile, CFG.SETTINGS_FILE, text)
@@ -182,6 +184,8 @@ local function loadSettings()
 			S.antiAfk = (v == "1")
 		elseif k == "autoRejoin" then
 			S.autoRejoin = (v == "1")
+		elseif k == "rodId" then
+			S.rodId = (v ~= "" and v) or nil
 		elseif k == "home" then
 			local x, y, z, lx, lz = v:match("^([%-%d%.]+),([%-%d%.]+),([%-%d%.]+),([%-%d%.]+),([%-%d%.]+)$")
 			if x then
@@ -592,20 +596,102 @@ local function waitChar(timeout)
 	return nil
 end
 
-local function getRod()
-	local char = lp.Character
-	return char and char:FindFirstChild(CFG.ROD_NAME)
+-- เบ็ดทุกแบบ: Tool ในมือชื่อเดียวกับ id ในกระเป๋า เช่น fishing_rod, rod_seraph_v2, rod_dragon
+-- id ในกระเป๋าอาจมีระดับอัปเกรดต่อท้าย เช่น rod_trex+5
+local function rodBase(id)
+	return (tostring(id or ""):gsub("%+%d+$", ""))
+end
+local function isRodId(name)
+	if type(name) ~= "string" or name == "" then
+		return false
+	end
+	if CFG.ROD_NAME ~= "" then
+		return rodBase(name) == rodBase(CFG.ROD_NAME)
+	end
+	local l = name:lower()
+	return l == "fishing_rod" or l:sub(1, 4) == "rod_" or l:find("rod", 1, true) ~= nil
+end
+local function rodPretty(id)
+	if not id then
+		return "-"
+	end
+	local base = rodBase(id)
+	if base == "fishing_rod" then
+		return "เบ็ดเริ่มต้น"
+	end
+	local plus = tostring(id):match("%+(%d+)$")
+	local name = base:gsub("^rod_", ""):gsub("_", " "):gsub("(%a)([%w]*)", function(a, b)
+		return a:upper() .. b
+	end)
+	return name .. (plus and (" +" .. plus) or "")
 end
 
+local rodWarned = false
+local function getRod()
+	local char = lp.Character
+	if not char then
+		return nil
+	end
+	local anyTool = nil
+	for _, c in ipairs(char:GetChildren()) do
+		if c:IsA("Tool") then
+			if isRodId(c.Name) then
+				if S.rodId == nil or rodBase(S.rodId) ~= rodBase(c.Name) then
+					S.rodId = c.Name
+					saveSettings()
+					log("จำเบ็ดที่ใช้:", c.Name)
+					updateUi()
+				end
+				return c
+			end
+			anyTool = anyTool or c
+		end
+	end
+	-- ถือ Tool ชื่อแปลก แต่เกมแสดงปุ่มเหวี่ยงอยู่ = เกมถือว่าเป็นเบ็ด
+	if anyTool then
+		local pg = lp:FindFirstChild("PlayerGui")
+		local hudGui = pg and pg:FindFirstChild("FishingHUD")
+		local fishing = hudGui and hudGui:FindFirstChild("Fishing")
+		local idle = fishing and fishing:FindFirstChild("Idle")
+		if idle and idle.Visible then
+			if not rodWarned then
+				rodWarned = true
+				log("ถือ Tool ชื่อ", anyTool.Name, "และเกมแสดงปุ่มเหวี่ยง ถือว่าเป็นเบ็ด")
+			end
+			return anyTool
+		end
+	end
+	return nil
+end
+
+-- หาช่องเบ็ดในกระเป๋า (ช่อง = ลำดับใน slots) เลือก: เบ็ดที่จำไว้ > เบ็ดพิเศษช่องแรก > fishing_rod
 local function rodSlot()
-	if type(bag.slots) == "table" then
-		for _, s in pairs(bag.slots) do
-			if type(s) == "table" and s.id == CFG.ROD_NAME and s.i then
-				return s.i
+	if type(bag.slots) ~= "table" then
+		return nil
+	end
+	local want = S.rodId and rodBase(S.rodId)
+	local bestFancy, bestAny = nil, nil
+	for k, it in pairs(bag.slots) do
+		if type(it) == "table" and isRodId(it.id) then
+			local slot = (type(it.i) == "number" and it.i) or (type(k) == "number" and k) or nil
+			if slot then
+				if want and rodBase(it.id) == want then
+					return slot, it.id
+				end
+				if rodBase(it.id) ~= "fishing_rod" and (not bestFancy or slot < bestFancy[1]) then
+					bestFancy = { slot, it.id }
+				end
+				if not bestAny or slot < bestAny[1] then
+					bestAny = { slot, it.id }
+				end
 			end
 		end
 	end
-	return 1
+	local pick = bestFancy or bestAny
+	if pick then
+		return pick[1], pick[2]
+	end
+	return nil
 end
 
 local function equipRod()
@@ -614,10 +700,47 @@ local function equipRod()
 		return false
 	end
 	if getRod() then
-		return true
+		return true -- ถือเบ็ดอยู่แล้ว (เบ็ดไหนก็ได้) ห้ามส่ง use ซ้ำ ไม่งั้นเบ็ดหลุดมือ
 	end
-	local slot = rodSlot()
-	log("ถือเบ็ด: ส่ง use slot", slot)
+	-- 1) มีเบ็ดเป็น Tool อยู่ใน Backpack: ถือด้วย EquipTool
+	local bp = lp:FindFirstChildOfClass("Backpack")
+	local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+	if bp and hum then
+		local pick = nil
+		for _, t in ipairs(bp:GetChildren()) do
+			if t:IsA("Tool") and isRodId(t.Name) then
+				if S.rodId and rodBase(t.Name) == rodBase(S.rodId) then
+					pick = t
+					break
+				end
+				pick = pick or t
+			end
+		end
+		if pick then
+			log("ถือเบ็ดจาก Backpack:", pick.Name)
+			pcall(function()
+				hum:EquipTool(pick)
+			end)
+			local t0 = os.clock()
+			while canRun() and os.clock() - t0 < 1.5 do
+				task.wait(0.1)
+				if getRod() then
+					return true
+				end
+			end
+		end
+	end
+	-- 2) ระบบกระเป๋าของเกม: BagRemotes.Action("use", ช่อง)
+	local slot, id = rodSlot()
+	if not slot then
+		if bag.slots == nil then
+			slot, id = 1, "?" -- ยังไม่ได้ข้อมูลกระเป๋า: ลองช่องแรกแบบเดิม
+		else
+			log("ไม่พบเบ็ดในกระเป๋า")
+			return false
+		end
+	end
+	log("ถือเบ็ด:", tostring(id), "ช่อง", slot)
 	bagAction:FireServer("use", slot)
 	local t0 = os.clock()
 	while canRun() and os.clock() - t0 < CFG.EQUIP_TIMEOUT do
@@ -1384,7 +1507,10 @@ task.spawn(function()
 				pressCastButton()
 			end
 			if watchdogResets >= 3 and not getRod() then
-				bagAction:FireServer("use", rodSlot())
+				local slot = rodSlot()
+				if slot then
+					bagAction:FireServer("use", slot)
+				end
 			end
 			setStatus("ขัดข้อง กู้อัตโนมัติ")
 			touch()
@@ -2404,13 +2530,14 @@ local function infoRow(card, name)
 end
 
 -- ===== หมวด: จุดตกปลา =====
-local cHome = section("จุดตกปลา", C.violet)
+local cHome = section("จุดตกปลา และเบ็ด", C.violet)
 switchRow(cHome, "ReturnHome", "กลับจุดเดิมอัตโนมัติ", "หลังซื้อขาย ถูกชน หรือตาย", function()
 	return S.returnHome
 end, function(v)
 	S.returnHome = v
 end)
 local lblHome = infoRow(cHome, "HomeInfo")
+local lblRod = infoRow(cHome, "RodInfo")
 local btnSetHome, btnClearHome = buttonRow(cHome, {
 	{ name = "SetHome", text = "ตั้งจุดนี้", style = "primary" },
 	{ name = "ClearHome", text = "ล้างจุด", style = "ghost" },
@@ -2671,6 +2798,17 @@ updateUi = function()
 	else
 		lblHome.Text = "ยังไม่ตั้งจุด  ·  จะจำให้เองตอนเหวี่ยงครั้งแรก"
 		lblHome.TextColor3 = C.mutedFg
+	end
+	local held = getRod()
+	if held then
+		lblRod.Text = "เบ็ดที่ใช้:  " .. rodPretty(held.Name) .. "  ·  ถืออยู่"
+		lblRod.TextColor3 = C.fg
+	elseif S.rodId then
+		lblRod.Text = "เบ็ดที่ใช้:  " .. rodPretty(S.rodId) .. "  ·  จะถือให้เองตอนเริ่ม"
+		lblRod.TextColor3 = C.fg
+	else
+		lblRod.Text = "เบ็ด: ถือเบ็ดที่อยากใช้ไว้ สคริปต์จะจำเอง (ใช้ได้ทุกเบ็ด)"
+		lblRod.TextColor3 = C.mutedFg
 	end
 	if lblAfkDesc then
 		lblAfkDesc.Text = afkPings > 0 and ("ทำงานแล้ว " .. afkPings .. " ครั้ง") or "กันโดนเตะเมื่อยืนนิ่งนาน"
