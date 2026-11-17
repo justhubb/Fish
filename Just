@@ -1,0 +1,2783 @@
+-- JIRAWAT Auto Fishing (v3)
+-- ออโต้ตกปลาครบวงจร รันฝั่ง client ผ่าน executor ขณะยืนใกล้น้ำ
+--   ถือเบ็ด -> เหวี่ยง -> รอปลากิน -> มินิเกม 3 รอบ -> จับได้ -> วนซ้ำ
+--   ขายปลาอัตโนมัติ   : ขายทั้งหมด หรือเลือกตามระดับ
+--   ซื้อเหยื่ออัตโนมัติ : เลือกชนิดเหยื่อ ตั้งจำนวนต่อเที่ยว ซื้อทันทีเมื่อเหยื่อเหลือ <= ค่าที่ตั้ง
+--   กลับจุดเดิม        : จำจุดที่ตกปลา กลับมาที่เดิมหลังซื้อขาย ถูกชน ตาย หรือหยุดแล้วเริ่มใหม่
+--   กัน AFK / หลุด     : ส่งอินพุตจำลองกันโดนเตะ และเข้าเกมใหม่เองเมื่อหลุด
+--   ระบบกันพัง         : watchdog, Remote มี timeout, กู้เองเมื่อค้าง/ตาย/เหวี่ยงไม่ติด
+--   UI                 : ลากย้ายได้ ย่อได้ เลื่อนได้ ตั้งค่าถูกบันทึกลงไฟล์ jirawat_settings.txt
+--
+-- เข้าเกมใหม่แล้วให้สคริปต์รันต่อเอง: บันทึกสคริปต์นี้เป็นไฟล์ jirawat_autofish.lua ในโฟลเดอร์ workspace
+-- ของ executor (หรือใส่ไว้ใน autoexec) สคริปต์จะส่งตัวเองไปรันต่อหลังเทเลพอร์ตผ่าน queue_on_teleport
+--
+-- มินิเกมแก้ด้วยสูตรที่พิสูจน์แล้วจาก log ของ af_spy (ตรง 6 จาก 6 การกด):
+--   ตำแหน่งเข็ม (0..1) = คลื่นสามเหลี่ยมของ s = phase + 2 * speed * dt
+--       m = s mod 2 ; ตำแหน่ง = (m <= 1) และ m หรือ 2 - m
+--   dt = เวลาจากต้นรอบ (รอบ 1 นับจากได้รับ "challenge", รอบถัดไปนับจากการกดครั้งก่อน)
+--   ช่องเป้าหมายอยู่ที่ c +- half (c = ตำแหน่ง ▼) สคริปต์กดตอนเข็มผ่าน c พอดี
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local env = (getgenv and getgenv()) or _G
+if env.AF_STOP then
+	pcall(env.AF_STOP)
+end
+
+local lp = Players.LocalPlayer
+local conns = {}
+local running = true -- สคริปต์ยังทำงานอยู่ (AF_STOP ตั้งเป็น false)
+
+-- ===================== ค่าคงที่ (ปรับได้) =====================
+local CFG = {
+	ROD_NAME = "fishing_rod",  -- ชื่อ Tool ในมือตอนถือเบ็ด
+	PRESS_MODE = "input",      -- วิธีกด "ดึง!": "input" (InputBegan), "activated", "space"
+	MIN_DT = 0.5,              -- ระยะห่างขั้นต่ำก่อนกดแต่ละรอบ (วินาที) กัน MIN_GAP ของเกม
+	T0_OFFSET = 0.016,         -- เกมเริ่มนับเวลาหลังเราได้รับ challenge ประมาณนี้ (วัดจาก log)
+	AIM_BIAS = 0.008,          -- กดเร็วขึ้นครึ่งเฟรม ชดเชยความหน่วง Heartbeat
+	IDLE_TIMEOUT = 8,          -- รอปุ่มเหวี่ยงแสดงสูงสุดกี่วินาที
+	CAST_TIMEOUT = 3,          -- รอ server ตอบ state on=true
+	EQUIP_TIMEOUT = 3,         -- รอเบ็ดขึ้นมือ
+	CYCLE_TIMEOUT = 45,        -- รอบหนึ่ง (เหวี่ยงถึงจับได้) นานสุดกี่วินาที
+	STALE_CAST = 30,           -- กำลังตกอยู่แต่ server เงียบนานเกินนี้ = สถานะค้าง ให้เหวี่ยงใหม่
+	RECAST_DELAY = 1.5,        -- พักก่อนเหวี่ยงรอบถัดไป
+	FAIL_BACKOFF = 2,          -- เหวี่ยงไม่ติด: พักเพิ่มครั้งละกี่วินาที (สูงสุด 10)
+	FULL_RETRY = 5,            -- กระเป๋าเต็มแต่ขายไม่ได้: ลองใหม่ทุกกี่วินาที
+	WATCHDOG = 60,             -- ไม่มีความคืบหน้านานเท่านี้ (วินาที) = ค้าง ให้กู้อัตโนมัติ
+	INVOKE_TIMEOUT = 8,        -- รอ InvokeServer สูงสุดกี่วินาที
+	BUY_CHUNK = 10,            -- ซื้อครั้งละกี่ชิ้น
+	SELL_WHEN_FREE_SLOTS = 0,  -- ขายล่วงหน้าเมื่อช่องว่างในกระเป๋า <= ค่านี้ (0 = ขายตอนเต็มพอดี)
+	REACH = 6,                 -- เดินไปให้ห่างจากจุด prompt ของร้านไม่เกินกี่ studs (แนวราบ)
+	WALK_TIMEOUT = 15,         -- เดินปกตินานเกินนี้ (วินาที) -> เปิด noclip
+	WALL_PROBE = 4,            -- เช็คกำแพงข้างหน้ากี่ studs
+	STUCK_CHECK = 1.5,         -- ทุกกี่วินาทีตรวจว่าขยับได้ไหม (ติด 2 ครั้งติด -> noclip)
+	NOCLIP_TIMEOUT = 12,       -- noclip แล้วยังไม่ถึงภายในกี่วินาที -> วาร์ป CFrame
+	FALL_DROP = 20,            -- ตัวละครต่ำกว่าจุดเริ่ม/ปลายทางเกินกี่ studs = ตก -> วาร์ป CFrame
+	HOME_FALL_Y = 8,           -- อยู่ต่ำ/สูงกว่าจุดตกปลาเกินกี่ studs = หล่นจากจุด -> วาร์ป CFrame กลับทันที
+	ALLOW_TELEPORT = true,     -- อนุญาตวาร์ป CFrame เป็นทางสุดท้าย (false = ไปไม่ถึงก็ข้ามรอบนั้น)
+	TRADE_COOLDOWN = 60,       -- ซื้อ/ขายไม่สำเร็จ (เช่น Coin ไม่พอ) พักกี่วินาทีก่อนลองใหม่
+	TRADE_MAX = 150,           -- เที่ยวซื้อ/ขายหนึ่งเที่ยวนานสุดกี่วินาที
+	AUTO_START = false,        -- true = เริ่มตกทันทีที่รันสคริปต์
+	HOME_RADIUS = 4,           -- ห่างจุดตกปลาเกินกี่ studs ถือว่าถูกดัน ให้กลับจุดเดิม
+	GUARD_INTERVAL = 1,        -- ตรวจตำแหน่งทุกกี่วินาที
+	ANTI_AFK_INTERVAL = 240,   -- ส่งอินพุตกัน AFK ทุกกี่วินาที (นอกเหนือจากตอนเกมแจ้ง Idled)
+	REJOIN_DELAY = 5,          -- หลุดแล้วรอกี่วินาทีก่อนเข้าเกมใหม่
+	REJOIN_RETRY = 20,         -- เข้าไม่ได้ ลองใหม่ทุกกี่วินาที
+	RESUME_WINDOW = 600,       -- รันใหม่หลังหลุดภายในกี่วินาที ให้เริ่มตกต่ออัตโนมัติ
+	SETTINGS_FILE = "jirawat_settings.txt",
+	SCRIPT_FILE = "jirawat_autofish.lua",
+	RESUME_FILE = "jirawat_resume.txt",
+}
+
+-- ระดับปลา (คีย์ตามที่ server ใช้) และเหยื่อในร้าน mystery_mart (จาก log: item 1,2,3)
+local KIND_LIST = { "common", "uncommon", "rare", "epic", "legendary", "mystery", "winter" }
+local BAITS = {
+	{ id = "bait_basic", name = "เหยื่อทั่วไป", item = 1, price = 3 },
+	{ id = "bait_medium", name = "เหยื่อขนาดกลาง", item = 2, price = 5 },
+	{ id = "bait_mystery", name = "เหยื่อลึกลับ", item = 3, price = 110 },
+}
+local SHOPS = {
+	fish = { id = "mystery_fish", path = { "Map", "MysteryIsle", "MysteryFishShop", "PromptPart" }, fallback = Vector3.new(-2603.34, 11.15, 2690.71) },
+	mart = { id = "mystery_mart", path = { "Map", "MysteryIsle", "MysteryMart", "PromptPart" }, fallback = Vector3.new(-2638.40, 12.55, 2709.33) },
+}
+
+-- ===================== ตั้งค่าที่ผู้ใช้เลือก (บันทึกลงไฟล์) =====================
+local S = {
+	autoSell = true,
+	sellAll = true,
+	sellKinds = { common = true, uncommon = true, rare = true, epic = true, legendary = true, mystery = true, winter = true },
+	autoBuy = true,
+	bait = "bait_mystery",
+	buyQty = 100,
+	buyBelow = 0,
+	returnHome = true,
+	antiAfk = true,
+	autoRejoin = true,
+	home = nil, -- { x, y, z, lx, lz } จุดตกปลาและทิศที่หัน
+}
+
+local function clamp(n, lo, hi)
+	if n < lo then
+		return lo
+	elseif n > hi then
+		return hi
+	end
+	return n
+end
+
+local function baitInfo(id)
+	for _, b in ipairs(BAITS) do
+		if b.id == id then
+			return b
+		end
+	end
+	return BAITS[3]
+end
+
+local function saveSettings()
+	if not writefile then
+		return
+	end
+	local kinds = {}
+	for _, k in ipairs(KIND_LIST) do
+		if S.sellKinds[k] then
+			kinds[#kinds + 1] = k
+		end
+	end
+	local text = table.concat({
+		"autoSell=" .. (S.autoSell and "1" or "0"),
+		"sellAll=" .. (S.sellAll and "1" or "0"),
+		"kinds=" .. table.concat(kinds, ","),
+		"autoBuy=" .. (S.autoBuy and "1" or "0"),
+		"bait=" .. S.bait,
+		"buyQty=" .. tostring(S.buyQty),
+		"buyBelow=" .. tostring(S.buyBelow),
+		"returnHome=" .. (S.returnHome and "1" or "0"),
+		"antiAfk=" .. (S.antiAfk and "1" or "0"),
+		"autoRejoin=" .. (S.autoRejoin and "1" or "0"),
+		"home=" .. (S.home and string.format("%.3f,%.3f,%.3f,%.4f,%.4f", S.home.x, S.home.y, S.home.z, S.home.lx, S.home.lz) or ""),
+	}, "\n")
+	pcall(writefile, CFG.SETTINGS_FILE, text)
+end
+
+local function loadSettings()
+	if not (readfile and isfile) then
+		return
+	end
+	local okExists, exists = pcall(isfile, CFG.SETTINGS_FILE)
+	if not (okExists and exists) then
+		return
+	end
+	local ok, text = pcall(readfile, CFG.SETTINGS_FILE)
+	if not (ok and type(text) == "string") then
+		return
+	end
+	for line in text:gmatch("[^\r\n]+") do
+		local k, v = line:match("^(%w+)=(.*)$")
+		if k == "autoSell" then
+			S.autoSell = (v == "1")
+		elseif k == "sellAll" then
+			S.sellAll = (v == "1")
+		elseif k == "kinds" then
+			local set = {}
+			for name in v:gmatch("[^,]+") do
+				set[name] = true
+			end
+			for _, kk in ipairs(KIND_LIST) do
+				S.sellKinds[kk] = set[kk] == true
+			end
+		elseif k == "autoBuy" then
+			S.autoBuy = (v == "1")
+		elseif k == "bait" then
+			S.bait = baitInfo(v).id
+		elseif k == "buyQty" then
+			S.buyQty = clamp(math.floor(tonumber(v) or S.buyQty), 1, 9999)
+		elseif k == "buyBelow" then
+			S.buyBelow = clamp(math.floor(tonumber(v) or S.buyBelow), 0, 999)
+		elseif k == "returnHome" then
+			S.returnHome = (v == "1")
+		elseif k == "antiAfk" then
+			S.antiAfk = (v == "1")
+		elseif k == "autoRejoin" then
+			S.autoRejoin = (v == "1")
+		elseif k == "home" then
+			local x, y, z, lx, lz = v:match("^([%-%d%.]+),([%-%d%.]+),([%-%d%.]+),([%-%d%.]+),([%-%d%.]+)$")
+			if x then
+				S.home = { x = tonumber(x), y = tonumber(y), z = tonumber(z), lx = tonumber(lx), lz = tonumber(lz) }
+			end
+		end
+	end
+end
+loadSettings()
+
+-- ===================== log =====================
+local logBuf = {}
+local function log(...)
+	local parts = {}
+	for i = 1, select("#", ...) do
+		parts[i] = tostring((select(i, ...)))
+	end
+	local line = string.format("[%.2f] %s", os.clock() % 1000, table.concat(parts, " "))
+	print("[AF]", line)
+	logBuf[#logBuf + 1] = line
+	if #logBuf > 400 then
+		table.remove(logBuf, 1)
+	end
+end
+
+local function copyLog()
+	local text = table.concat(logBuf, "\n")
+	if setclipboard then
+		pcall(setclipboard, text)
+	end
+	if writefile then
+		pcall(writefile, "af_log.txt", text)
+	end
+end
+
+local function ser(v, depth)
+	depth = depth or 0
+	if type(v) == "table" then
+		if depth >= 2 then
+			return "{...}"
+		end
+		local parts = {}
+		for k, x in pairs(v) do
+			parts[#parts + 1] = tostring(k) .. "=" .. ser(x, depth + 1)
+		end
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	return tostring(v)
+end
+
+-- ===================== สถานะรวม =====================
+local enabled = false          -- ปุ่มเริ่ม/หยุดตกปลา (AUTO_START จะเปิดให้หลังโหลด UI)
+local manualRun = false        -- กำลังซื้อ/ขายแบบกดมือ (อนุญาตให้เดินแม้ออโต้ปิดอยู่)
+local busy = false             -- กำลังเดินซื้อ/ขาย (watchdog จะไม่แทรก)
+local catches = 0
+local coinsEarned = 0
+local trips = 0
+local statusText = "ปิดอยู่"
+local updateUi = function() end -- ถูกกำหนดตอนสร้าง UI
+local homeCFrame, setHomeHere, homeDistance -- ประกาศล่วงหน้า (กำหนดในส่วนจุดตกปลา)
+local stopNoclip = nil -- ประกาศล่วงหน้า (กำหนดในระบบเดิน) ใช้คืนค่าการชนตอนปิดสคริปต์
+local homeReturns = 0
+local afkPings = 0
+
+local lastProgress = os.clock()
+local function touch()
+	lastProgress = os.clock()
+end
+
+local function setStatus(t)
+	statusText = t
+	touch()
+	updateUi()
+end
+
+local function canRun()
+	return running and (enabled or manualRun)
+end
+
+env.AF_COPY = copyLog -- รัน AF_COPY() เพื่อคัดลอก log (และไฟล์ af_log.txt)
+local guiRef = nil
+env.AF_STOP = function()
+	running = false
+	for _, c in ipairs(conns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	for i = #conns, 1, -1 do
+		conns[i] = nil
+	end
+	saveSettings()
+	if stopNoclip then
+		pcall(stopNoclip)
+	end
+	if guiRef then
+		pcall(function()
+			guiRef:Destroy()
+		end)
+	end
+	log("หยุดแล้ว")
+end
+
+-- ===================== Remote =====================
+local fishingRemotes = RS:WaitForChild("FishingRemotes", 10)
+local fishingEvent = fishingRemotes and fishingRemotes:WaitForChild("Event", 10)
+local bagRemotes = RS:WaitForChild("BagRemotes", 10)
+local bagAction = bagRemotes and bagRemotes:WaitForChild("Action", 10)
+local bagSync = bagRemotes and bagRemotes:WaitForChild("Sync", 10)
+local shopRemotes = RS:WaitForChild("ShopRemotes", 10)
+if not (fishingEvent and bagAction) then
+	log("ไม่พบ Remote (FishingRemotes.Event / BagRemotes.Action) หยุด")
+	return
+end
+if not shopRemotes then
+	log("ไม่พบ ShopRemotes: ปิดระบบซื้อ/ขายอัตโนมัติ")
+end
+
+-- เรียก InvokeServer พร้อม timeout กันค้างตลอดไป
+local function invoke(name, ...)
+	local r = shopRemotes and shopRemotes:FindFirstChild(name)
+	if not r then
+		return nil, "ไม่พบ ShopRemotes." .. name
+	end
+	local args = table.pack(...)
+	local done, ok, res = false, false, nil
+	task.spawn(function()
+		ok, res = pcall(function()
+			return r:InvokeServer(table.unpack(args, 1, args.n))
+		end)
+		done = true
+	end)
+	local t0 = os.clock()
+	while not done and os.clock() - t0 < CFG.INVOKE_TIMEOUT do
+		task.wait(0.05)
+	end
+	touch()
+	if not done then
+		return nil, "timeout"
+	end
+	if not ok then
+		return nil, tostring(res)
+	end
+	return res
+end
+
+-- ===================== ข้อมูลกระเป๋า (จาก BagRemotes.Sync) =====================
+local bag = { capacity = nil, used = nil, slots = nil }
+
+local function freeSlots()
+	if bag.capacity and bag.used then
+		return bag.capacity - bag.used
+	end
+	return nil
+end
+
+local function bagCount(id)
+	if type(bag.slots) == "table" then
+		for _, s in pairs(bag.slots) do
+			if type(s) == "table" and s.id == id then
+				return s.n or 0
+			end
+		end
+		return 0
+	end
+	return nil
+end
+
+local function baitCount(id)
+	local a = lp:GetAttribute("Bait_" .. id)
+	if type(a) == "number" then
+		return a
+	end
+	if lp:GetAttribute("SettingsLoaded") then
+		return bagCount(id) or 0
+	end
+	return nil
+end
+
+if bagSync then
+	table.insert(conns, bagSync.OnClientEvent:Connect(function(data)
+		if type(data) == "table" and type(data.slots) == "table" then
+			local n = 0
+			for _ in pairs(data.slots) do
+				n = n + 1
+			end
+			bag.slots = data.slots
+			bag.used = n
+			if type(data.capacity) == "number" then
+				bag.capacity = data.capacity
+			end
+		end
+	end))
+end
+
+-- ===================== สูตรเข็ม =====================
+local function needlePos(phase, w, dt)
+	local m = (phase + w * dt) % 2
+	if m > 1 then
+		return 2 - m
+	end
+	return m
+end
+
+-- เวลา dt (>= dmin) ที่เข็มผ่านตำแหน่ง c พอดี: m = c หรือ m = 2 - c (mod 2)
+local function timeToCenter(phase, w, c, dmin)
+	local best = nil
+	for k = -1, 3 do
+		local a, b = c + 2 * k, 2 - c + 2 * k
+		for _, ts in ipairs({ a, b }) do
+			local dt = (ts - phase) / w
+			if dt >= dmin and (best == nil or dt < best) then
+				best = dt
+			end
+		end
+	end
+	return best
+end
+
+-- ===================== กดปุ่ม "ดึง!" =====================
+local function getHudCard()
+	local pg = lp:FindFirstChild("PlayerGui")
+	local hud = pg and pg:FindFirstChild("HandFishHUD")
+	if hud and hud.Enabled then
+		return hud:FindFirstChild("Card")
+	end
+	return nil
+end
+
+local function firePress(card, mode)
+	local btn = card:FindFirstChild("TextButton")
+	if not btn then
+		return false
+	end
+	if mode == "space" then
+		local vim = game:GetService("VirtualInputManager")
+		vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+		task.wait(0.03)
+		vim:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+		return true
+	end
+	if not getconnections then
+		return false
+	end
+	local sig = (mode == "activated") and btn.Activated or btn.InputBegan
+	local fired = 0
+	for _, c in ipairs(getconnections(sig)) do
+		pcall(function()
+			if mode == "activated" then
+				c:Fire()
+			else
+				-- handler ของเกมตรวจ UserInputType เป็น MouseButton1 / Touch
+				c:Fire({
+					UserInputType = Enum.UserInputType.MouseButton1,
+					UserInputState = Enum.UserInputState.Begin,
+					KeyCode = Enum.KeyCode.Unknown,
+				}, false)
+			end
+		end)
+		fired = fired + 1
+	end
+	return fired > 0
+end
+
+local function pressPull(card)
+	if firePress(card, CFG.PRESS_MODE) then
+		return true
+	end
+	-- วิธีหลักไม่เจอ connection: ลองวิธีสำรองตามลำดับ
+	for _, m in ipairs({ "input", "activated", "space" }) do
+		if m ~= CFG.PRESS_MODE and firePress(card, m) then
+			log("pressPull: ใช้วิธีสำรอง", m)
+			return true
+		end
+	end
+	log("pressPull: กดไม่ได้เลย")
+	return false
+end
+
+-- ===================== แก้มินิเกมจากข้อมูล challenge =====================
+local activeChallenge = nil
+
+local function validRound(r)
+	return type(r) == "table" and type(r.speed) == "number" and r.speed > 0
+		and type(r.phase) == "number" and type(r.c) == "number" and type(r.half) == "number"
+end
+
+local function solveChallenge(data, tRecv)
+	if type(data) ~= "table" or type(data.rounds) ~= "table" then
+		log("challenge รูปแบบไม่ตรงที่คาด:", ser(data))
+		return
+	end
+	activeChallenge = data.id
+	local myId = data.id
+	local t0 = tRecv + CFG.T0_OFFSET
+	local roundStart = t0
+	log(string.format("challenge id=%s rarity=%s rounds=%d maxMisses=%s", tostring(data.id), tostring(data.rarity), #data.rounds, tostring(data.maxMisses)))
+
+	for i, r in ipairs(data.rounds) do
+		if not (canRun() and activeChallenge == myId) then
+			return
+		end
+		if not validRound(r) then
+			log("รอบ", i, "ข้อมูลไม่ครบ:", ser(r))
+			return
+		end
+		local w = 2 * r.speed
+		local now = os.clock()
+		local dmin = math.max(CFG.MIN_DT, now - roundStart + 0.05)
+		local dt = timeToCenter(r.phase, w, r.c, dmin)
+		if not dt then
+			log("รอบ", i, "หาเวลากดไม่ได้")
+			return
+		end
+		local target = roundStart + dt - CFG.AIM_BIAS
+		while canRun() and activeChallenge == myId and os.clock() < target do
+			RunService.Heartbeat:Wait()
+		end
+		local card = getHudCard()
+		if not (canRun() and activeChallenge == myId and card) then
+			log("รอบ", i, "ยกเลิก (HUD ปิดหรือ challenge เปลี่ยน)")
+			return
+		end
+		local pressT = os.clock()
+		local expect = needlePos(r.phase, w, pressT - roundStart)
+		log(string.format("รอบ %d: กด dt=%.3f คาดว่าเข็ม=%.3f c=%.3f half=%.3f", i, pressT - roundStart, expect, r.c, r.half))
+		pressPull(card)
+		roundStart = pressT
+		touch()
+	end
+end
+
+-- ===================== ฟัง server =====================
+local castConfirmed = false
+local cycleDone = false   -- รอบนี้จบแล้ว (จับปลาได้ หรือ server ปิด state)
+local cycleReason = nil   -- เหตุผลที่ server ปิด state เช่น "full"
+local casting = false     -- server บอกว่ากำลังตกอยู่ (state on=true) ถึงแม้เกมเหวี่ยงต่อให้เองก็ไม่กดเหวี่ยงซ้ำ
+local watchdogResets = 0
+local lastFishEvent = 0   -- เวลาล่าสุดที่ server ส่ง event ตกปลา (ใช้ตรวจสถานะค้าง)
+
+table.insert(conns, fishingEvent.OnClientEvent:Connect(function(kind, data)
+	local recvT = os.clock()
+	lastFishEvent = recvT
+	touch()
+	if kind ~= "challenge" then
+		log("SERVER ->", tostring(kind), ser(data))
+	end
+	if kind == "challenge" then
+		if enabled then
+			setStatus("มินิเกม")
+			task.spawn(solveChallenge, data, recvT)
+		end
+	elseif kind == "state" and type(data) == "table" then
+		if data.on == true then
+			castConfirmed = true
+			casting = true
+			if enabled then
+				setStatus("รอปลากิน")
+			end
+		elseif data.on == false then
+			casting = false
+			cycleReason = data.reason
+			cycleDone = true
+		end
+	elseif kind == "catch" then
+		catches = catches + 1
+		watchdogResets = 0
+		activeChallenge = nil
+		log("จับได้ครั้งที่", catches)
+		cycleDone = true
+		updateUi()
+	end
+end))
+
+-- log ข้อความบน HUD มินิเกม (เยี่ยม!/พลาด!)
+task.spawn(function()
+	local pg = lp:WaitForChild("PlayerGui")
+	local hud = pg:WaitForChild("HandFishHUD", 10)
+	local card = hud and hud:WaitForChild("Card", 10)
+	local label = card and card:WaitForChild("TextLabel", 10)
+	if label then
+		table.insert(conns, label:GetPropertyChangedSignal("Text"):Connect(function()
+			log("HUD:", (tostring(label.Text):gsub("\n", " ")))
+		end))
+	end
+end)
+
+-- ตายแล้วเกิดใหม่: ล้างสถานะค้าง
+table.insert(conns, lp.CharacterAdded:Connect(function()
+	log("เกิดใหม่: ล้างสถานะ")
+	activeChallenge = nil
+	castConfirmed = false
+	casting = false
+	cycleDone = true
+	touch()
+end))
+
+-- ===================== ถือเบ็ด / เหวี่ยง =====================
+local function waitChar(timeout)
+	local t0 = os.clock()
+	while canRun() and os.clock() - t0 < timeout do
+		local c = lp.Character
+		if c and c:FindFirstChild("HumanoidRootPart") and c:FindFirstChildOfClass("Humanoid") then
+			return c
+		end
+		task.wait(0.2)
+	end
+	return nil
+end
+
+local function getRod()
+	local char = lp.Character
+	return char and char:FindFirstChild(CFG.ROD_NAME)
+end
+
+local function rodSlot()
+	if type(bag.slots) == "table" then
+		for _, s in pairs(bag.slots) do
+			if type(s) == "table" and s.id == CFG.ROD_NAME and s.i then
+				return s.i
+			end
+		end
+	end
+	return 1
+end
+
+local function equipRod()
+	if not waitChar(10) then
+		log("ไม่มีตัวละคร")
+		return false
+	end
+	if getRod() then
+		return true
+	end
+	local slot = rodSlot()
+	log("ถือเบ็ด: ส่ง use slot", slot)
+	bagAction:FireServer("use", slot)
+	local t0 = os.clock()
+	while canRun() and os.clock() - t0 < CFG.EQUIP_TIMEOUT do
+		task.wait(0.1)
+		if getRod() then
+			return true
+		end
+	end
+	log("เบ็ดไม่ขึ้นมือภายใน", CFG.EQUIP_TIMEOUT, "วินาที")
+	return false
+end
+
+local function getIdle()
+	local pg = lp:FindFirstChild("PlayerGui")
+	local hudGui = pg and pg:FindFirstChild("FishingHUD")
+	local fishing = hudGui and hudGui:FindFirstChild("Fishing")
+	return fishing and fishing:FindFirstChild("Idle")
+end
+
+-- รอให้ปุ่มเหวี่ยง (Idle) แสดง ก่อนกดเหวี่ยง
+-- เพราะถ้ากดตอนกำลังเหวี่ยงอยู่ handler ของเกมจะยกเลิกการเหวี่ยง (const "cancel" ใน FishingClient)
+local function waitIdleVisible(timeout)
+	local t0 = os.clock()
+	while canRun() and os.clock() - t0 < timeout do
+		local idle = getIdle()
+		if idle and idle.Visible then
+			return true
+		end
+		task.wait(0.2)
+	end
+	return false
+end
+
+-- กดปุ่มเหวี่ยงของเกมเอง (FishingHUD.Fishing.Idle.Prompt)
+-- handler ของเกมเช็คเหยื่อ/เกาะ/ที่นั่ง และคำนวณพิกัดเหวี่ยงจากทิศที่ตัวละครหันเอง
+local function pressCastButton()
+	local idle = getIdle()
+	local btn = idle and idle:FindFirstChild("Prompt")
+	if not btn then
+		log("ไม่พบ FishingHUD.Fishing.Idle.Prompt")
+		return false
+	end
+	if getconnections then
+		local fired = 0
+		for _, c in ipairs(getconnections(btn.Activated)) do
+			pcall(function()
+				c:Fire()
+			end)
+			fired = fired + 1
+		end
+		if fired > 0 then
+			return true
+		end
+	end
+	if firesignal then
+		firesignal(btn.Activated)
+		return true
+	end
+	log("executor ไม่รองรับ getconnections/firesignal")
+	return false
+end
+
+local function cast()
+	castConfirmed = false
+	log("เหวี่ยง BaitChoice=" .. tostring(lp:GetAttribute("BaitChoice")) .. " InMysteryZone=" .. tostring(lp:GetAttribute("InMysteryZone")))
+	pressCastButton()
+	local t0 = os.clock()
+	while canRun() and os.clock() - t0 < CFG.CAST_TIMEOUT do
+		task.wait(0.1)
+		if castConfirmed then
+			return true
+		end
+		if cycleDone then
+			return false -- server ปิด state ทันที (เช่น กระเป๋าเต็ม)
+		end
+	end
+	log("server ไม่ตอบ state on=true ภายใน", CFG.CAST_TIMEOUT, "วินาที")
+	return false
+end
+
+-- ===================== ซื้อเหยื่อ / ขายปลา =====================
+-- remote (จาก log ของ af_spy_buy):
+--   ShopRemotes.Info:InvokeServer(shopId)                      เปิดร้าน คืน {coins, owned, total, ...}
+--   ShopRemotes.Buy:InvokeServer("mystery_mart", item, qty)    คืน {ok, message, coins, owned}
+--   ShopRemotes.SellPick:InvokeServer("mystery_fish", {kinds}) ตั้งหมวดปลาที่จะขาย คืน {ok, total, ...}
+--   ShopRemotes.Sell:InvokeServer("mystery_fish", "all", nil)  ขายทั้งหมดตามหมวดที่เลือก คืน {ok, message, coins}
+local tradeBlockedUntilSell = 0
+local tradeBlockedUntilBuy = 0
+local pendingSell = false
+local forceTrade = false -- ปุ่ม "ขาย/ซื้อตอนนี้"
+
+local function getRoot()
+	local c = lp.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+	local c = lp.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function flatDist(a, b)
+	local dx, dz = a.X - b.X, a.Z - b.Z
+	return math.sqrt(dx * dx + dz * dz)
+end
+
+local function shopPos(shop)
+	local cur = workspace
+	for _, n in ipairs(shop.path) do
+		cur = cur and cur:FindFirstChild(n)
+	end
+	if cur and cur:IsA("BasePart") then
+		return cur.Position
+	end
+	return shop.fallback
+end
+
+-- ---------- จุดตกปลา (home) ----------
+-- เก็บเป็นตำแหน่ง + ทิศที่หัน เพราะทิศการเหวี่ยงขึ้นกับทิศที่ตัวละครหัน
+homeCFrame = function()
+	local h = S.home
+	if not h then
+		return nil
+	end
+	local pos = Vector3.new(h.x, h.y, h.z)
+	local look = Vector3.new(h.lx, 0, h.lz)
+	if look.Magnitude < 0.01 then
+		return CFrame.new(pos)
+	end
+	return CFrame.new(pos, pos + look)
+end
+
+setHomeHere = function(reason)
+	local root = getRoot()
+	if not root then
+		return false
+	end
+	local p = root.Position
+	local lv = root.CFrame.LookVector
+	S.home = { x = p.X, y = p.Y, z = p.Z, lx = lv and lv.X or 0, lz = lv and lv.Z or -1 }
+	saveSettings()
+	log(string.format("%s (%.1f, %.1f, %.1f)", reason or "ตั้งจุดตกปลา", p.X, p.Y, p.Z))
+	updateUi()
+	return true
+end
+
+homeDistance = function()
+	local root = getRoot()
+	local h = S.home
+	if not (root and h) then
+		return nil
+	end
+	local p = root.Position
+	local dx, dz = p.X - h.x, p.Z - h.z
+	return math.sqrt(dx * dx + dz * dz), math.abs(p.Y - h.y)
+end
+
+-- ---------- ระบบเดิน: เช็คกำแพง -> กระโดด -> noclip ชั่วคราว -> CFrame (ทางสุดท้าย) ----------
+-- noclip: ปิด CanCollide ของชิ้นส่วนตัวละครทุกเฟรม (Humanoid คืนค่าเองทุกเฟรม จึงต้องทำซ้ำ)
+-- จำเฉพาะชิ้นที่เราปิดไว้ แล้วคืนค่าเดิมทันทีที่ถึงจุด / หยุด / ตาย / ปิดสคริปต์
+local noclipSaved, noclipConn = nil, nil
+local function applyNoclip()
+	local c = lp.Character
+	if not (c and noclipSaved) then
+		return
+	end
+	for _, part in ipairs(c:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			if noclipSaved[part] == nil then
+				noclipSaved[part] = true
+			end
+			part.CanCollide = false
+		end
+	end
+end
+local function setNoclip(on, why)
+	if on then
+		if noclipSaved then
+			return
+		end
+		noclipSaved = {}
+		applyNoclip()
+		pcall(function()
+			noclipConn = RunService.Stepped:Connect(applyNoclip)
+		end)
+		log("เปิด noclip ชั่วคราว:", why or "")
+	else
+		if not noclipSaved then
+			return
+		end
+		if noclipConn then
+			pcall(function()
+				noclipConn:Disconnect()
+			end)
+			noclipConn = nil
+		end
+		local saved = noclipSaved
+		noclipSaved = nil
+		for part, v in pairs(saved) do
+			pcall(function()
+				if part.Parent then
+					part.CanCollide = v
+				end
+			end)
+		end
+		log("ปิด noclip คืนค่าการชนแล้ว")
+	end
+end
+stopNoclip = function()
+	setNoclip(false)
+end
+
+local function rayParamsFor(char)
+	local ok, rp = pcall(function()
+		local params = RaycastParams.new()
+		local okEx = pcall(function()
+			params.FilterType = Enum.RaycastFilterType.Exclude
+		end)
+		if not okEx then
+			params.FilterType = Enum.RaycastFilterType.Blacklist
+		end
+		params.FilterDescendantsInstances = { char }
+		pcall(function()
+			params.RespectCanCollide = true
+		end)
+		return params
+	end)
+	return ok and rp or nil
+end
+
+-- มองไปข้างหน้า WALL_PROBE studs ตามทิศเป้าหมาย ยิง 3 ระดับ: เข่า / ลำตัว / เหนือหัว
+-- คืน "none" = ทางโล่ง, "low" = กำแพงเตี้ยกระโดดข้ามได้, "high" = กำแพงสูงเกินกระโดด
+local function wallAhead(root, rp, target)
+	if not rp then
+		return "none"
+	end
+	local p = root.Position
+	local flat = Vector3.new(target.X - p.X, 0, target.Z - p.Z)
+	local m = flat.Magnitude
+	if m < 0.5 then
+		return "none"
+	end
+	local dir = flat.Unit * math.min(CFG.WALL_PROBE, m)
+	local function blocked(yOff)
+		local ok, r = pcall(function()
+			return workspace:Raycast(p + Vector3.new(0, yOff, 0), dir, rp)
+		end)
+		if not (ok and r and r.Instance) then
+			return false
+		end
+		if r.Instance.CanCollide == false then
+			return false
+		end
+		if r.Normal and r.Normal.Y > 0.6 then
+			return false -- พื้นลาด/บันได เดินขึ้นได้ ไม่ใช่กำแพง
+		end
+		return true
+	end
+	local knee, chest, top = blocked(-1.5), blocked(0.5), blocked(4)
+	if not (knee or chest) then
+		return "none"
+	end
+	return top and "high" or "low"
+end
+
+local function voidY()
+	local y = -500
+	pcall(function()
+		y = workspace.FallenPartsDestroyHeight
+	end)
+	return y + 40
+end
+
+-- วาร์ปด้วย CFrame (ใช้เมื่อตก หรือติดจริงๆ แม้ noclip แล้ว)
+local function cfTo(pos, why)
+	local root = getRoot()
+	if not root then
+		return false
+	end
+	log(string.format("วาร์ป CFrame (%s) ไป (%.1f, %.1f, %.1f)", why, pos.X, pos.Y, pos.Z))
+	root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+	pcall(function()
+		root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	end)
+	task.wait(0.3)
+	return true
+end
+
+-- เดินไปที่จุด ทีละขั้น:
+--   1) MoveTo ปกติ + Raycast เช็คกำแพงข้างหน้า: กำแพงเตี้ยกระโดด
+--   2) กำแพงสูงขวาง หรือขยับไม่ได้ติดกัน / เดินนานเกิน WALK_TIMEOUT -> เปิด noclip เดินทะลุ
+--   3) noclip แล้วยังไปไม่ถึง (ขยับไม่ได้ หรือเกิน NOCLIP_TIMEOUT) หรือตกลงไป -> วาร์ป CFrame
+--   noclip ถูกปิดและคืนค่าเสมอเมื่อจบ ไม่ว่าจะสำเร็จ ล้มเหลว หรือ error
+local function walkTo(pos, stopDist)
+	local root, hum = getRoot(), getHum()
+	if not (root and hum) then
+		return false
+	end
+	if hum.SeatPart then
+		hum.Sit = false
+		task.wait(0.4)
+	end
+	local rp = rayParamsFor(lp.Character)
+	local floorY = math.min(root.Position.Y, pos.Y) - CFG.FALL_DROP
+	local vY = voidY()
+	local t0 = os.clock()
+	local lastMove, lastJump = 0, 0
+	local lastCheck, lastPos = os.clock(), root.Position
+	local stuck, highHits = 0, 0
+	local noclipAt = nil
+	local result = false
+
+	local function escalate(why)
+		if not noclipAt then
+			noclipAt = os.clock()
+			setNoclip(true, why)
+			lastCheck, lastPos = os.clock(), getRoot() and getRoot().Position or lastPos
+		end
+	end
+	local function lastResort(why)
+		if CFG.ALLOW_TELEPORT then
+			return cfTo(pos, why)
+		end
+		log("ไปไม่ถึง (" .. why .. ") และปิดการวาร์ปไว้")
+		return false
+	end
+
+	local ok, err = pcall(function()
+		while canRun() do
+			root, hum = getRoot(), getHum()
+			if not (root and hum) or hum.Health <= 0 then
+				result = false
+				return
+			end
+			local p = root.Position
+			if flatDist(p, pos) <= stopDist and math.abs(p.Y - pos.Y) < 12 then
+				result = true
+				return
+			end
+			-- ตกลงไป (ต่ำกว่าจุดเริ่ม/ปลายทางมาก หรือใกล้ขอบล่างของแมพ)
+			if p.Y < floorY or p.Y < vY then
+				log(string.format("ตกลงไป (Y %.0f)", p.Y))
+				result = lastResort("ตก")
+				return
+			end
+			if noclipAt then
+				applyNoclip()
+				if os.clock() - noclipAt > CFG.NOCLIP_TIMEOUT then
+					result = lastResort("noclip แล้วยังไปไม่ถึง")
+					return
+				end
+			elseif os.clock() - t0 > CFG.WALK_TIMEOUT then
+				escalate("เดินนานเกิน " .. CFG.WALK_TIMEOUT .. " วินาที")
+			end
+			if os.clock() - lastMove > 1 then
+				lastMove = os.clock()
+				hum:MoveTo(pos)
+			end
+			-- เช็คกำแพง (เฉพาะตอนยังไม่ noclip)
+			if not noclipAt then
+				local w = wallAhead(root, rp, pos)
+				if w == "low" then
+					highHits = 0
+					if os.clock() - lastJump > 0.8 then
+						lastJump = os.clock()
+						hum.Jump = true
+					end
+				elseif w == "high" then
+					highHits = highHits + 1
+					if highHits >= 3 then
+						escalate("กำแพงสูงขวางทาง")
+					end
+				else
+					highHits = 0
+				end
+			end
+			-- ตรวจว่าติด: STUCK_CHECK วินาทีขยับไม่ถึง 1 stud
+			if os.clock() - lastCheck > CFG.STUCK_CHECK then
+				local moved = flatDist(root.Position, lastPos)
+				lastCheck, lastPos = os.clock(), root.Position
+				if moved < 1 then
+					stuck = stuck + 1
+					if noclipAt then
+						if stuck >= 2 then
+							result = lastResort("ติดแม้ noclip")
+							return
+						end
+					else
+						hum.Jump = true
+						lastJump = os.clock()
+						if stuck >= 2 then
+							escalate("ติด ขยับไม่ได้")
+							stuck = 0
+						end
+					end
+				else
+					stuck = 0
+				end
+			end
+			task.wait(0.1)
+		end
+	end)
+	setNoclip(false)
+	if not ok then
+		log("ระบบเดินขัดข้อง:", tostring(err))
+		return false
+	end
+	return result
+end
+
+local function visit(shop)
+	local pos = shopPos(shop)
+	log(string.format("ไปร้าน %s ที่ (%.1f, %.1f, %.1f)", shop.id, pos.X, pos.Y, pos.Z))
+	return walkTo(pos, CFG.REACH)
+end
+
+local function sellKindsTable()
+	local t = {}
+	for _, k in ipairs(KIND_LIST) do
+		t[k] = S.sellAll or S.sellKinds[k] == true
+	end
+	return t
+end
+
+local function anyKindSelected()
+	if S.sellAll then
+		return true
+	end
+	for _, k in ipairs(KIND_LIST) do
+		if S.sellKinds[k] then
+			return true
+		end
+	end
+	return false
+end
+
+-- คืน true = ขายแล้ว / "nothing" = ไม่มีปลาในหมวดที่เลือก / false = ผิดพลาด
+local function sellFish()
+	if not anyKindSelected() then
+		log("ขาย: ไม่ได้เลือกระดับปลาที่จะขายเลย")
+		return "nothing"
+	end
+	local info, err = invoke("Info", SHOPS.fish.id)
+	if not info then
+		log("ขาย: Info ล้มเหลว", tostring(err))
+		return false
+	end
+	local pick, err2 = invoke("SellPick", SHOPS.fish.id, sellKindsTable())
+	if not pick then
+		log("ขาย: SellPick ล้มเหลว", tostring(err2))
+		return false
+	end
+	if pick.ok == false then
+		log("ขาย: SellPick ไม่สำเร็จ:", tostring(pick.message))
+		return false
+	end
+	if type(pick.total) == "number" and pick.total <= 0 then
+		log("ขาย: ไม่มีปลาในหมวดที่เลือก")
+		return "nothing"
+	end
+	local res, err3 = invoke("Sell", SHOPS.fish.id, "all", nil)
+	if not res then
+		log("ขาย: Sell ล้มเหลว", tostring(err3))
+		return false
+	end
+	log("ขาย:", tostring(res.message), "coins=" .. tostring(res.coins), "ok=" .. tostring(res.ok))
+	if res.ok ~= true then
+		return false
+	end
+	if type(pick.total) == "number" then
+		coinsEarned = coinsEarned + pick.total
+	end
+	return true
+end
+
+-- คืน true = ซื้อสำเร็จ / "full" = กระเป๋าเต็ม ต้องขายก่อน / false = ซื้อไม่ได้ (เช่น Coin ไม่พอ)
+local function buyBait()
+	local b = baitInfo(S.bait)
+	local info, err = invoke("Info", SHOPS.mart.id)
+	if not info then
+		log("ซื้อ: Info ล้มเหลว", tostring(err))
+		return false
+	end
+	local coins = info.coins or 0
+	local afford = math.floor(coins / b.price)
+	local total = math.min(S.buyQty, afford)
+	log(string.format("ซื้อ: %s ต้องการ %d ชิ้น Coin %d (ซื้อได้ %d)", b.name, S.buyQty, coins, afford))
+	if total <= 0 then
+		log("ซื้อ: Coin ไม่พอ")
+		return false
+	end
+	local bought = 0
+	while total > 0 and canRun() do
+		local n = math.min(total, CFG.BUY_CHUNK)
+		local res, err2 = invoke("Buy", SHOPS.mart.id, b.item, n)
+		if not res then
+			log("ซื้อ: Buy ล้มเหลว", tostring(err2))
+			return bought > 0
+		end
+		if res.ok ~= true then
+			log("ซื้อ: ไม่สำเร็จ:", tostring(res.message))
+			if type(res.message) == "string" and res.message:find("กระเป๋า", 1, true) then
+				return "full"
+			end
+			return bought > 0
+		end
+		bought = bought + n
+		total = total - n
+		task.wait(0.3)
+	end
+	log("ซื้อ: รวม", bought, "ชิ้น")
+	return bought > 0
+end
+
+local function wantSell()
+	if not S.autoSell or os.clock() < tradeBlockedUntilSell then
+		return false
+	end
+	if pendingSell then
+		return true
+	end
+	local free = freeSlots()
+	return free ~= nil and free <= CFG.SELL_WHEN_FREE_SLOTS
+end
+
+local function wantBuy()
+	if not S.autoBuy or not shopRemotes or os.clock() < tradeBlockedUntilBuy then
+		return false
+	end
+	local have = baitCount(S.bait)
+	return have ~= nil and have <= S.buyBelow
+end
+
+-- เที่ยวซื้อ/ขาย: เดินไปร้าน -> ทำรายการ -> เดินกลับจุดเดิม (ห่อด้วย pcall ใน runTrade)
+local function doTrade(needSell, needBuy)
+	local tStart = os.clock()
+	local root = getRoot()
+	if not root then
+		return
+	end
+	local home = homeCFrame() or root.CFrame
+	trips = trips + 1
+	local sellOk, buyOk = true, true
+
+	local function timeUp()
+		return os.clock() - tStart > CFG.TRADE_MAX
+	end
+
+	if needSell and shopRemotes then
+		setStatus("ไปขายปลา")
+		if visit(SHOPS.fish) then
+			local r = sellFish()
+			if r == "nothing" then
+				tradeBlockedUntilSell = os.clock() + CFG.TRADE_COOLDOWN
+				log("ไม่มีปลาให้ขายตามหมวดที่เลือก พักการขาย", CFG.TRADE_COOLDOWN, "วินาที")
+			end
+			sellOk = (r == true or r == "nothing")
+		else
+			sellOk = false
+		end
+	end
+
+	if needBuy and canRun() and not timeUp() and shopRemotes then
+		setStatus("ไปซื้อเหยื่อ")
+		if visit(SHOPS.mart) then
+			local r = buyBait()
+			if r == "full" and S.autoSell and not timeUp() then
+				-- ซื้อไม่ได้เพราะกระเป๋าเต็ม: ไปขายปลาก่อนแล้วกลับมาซื้อใหม่
+				setStatus("กระเป๋าเต็ม ไปขายปลาก่อน")
+				if visit(SHOPS.fish) and sellFish() == true and visit(SHOPS.mart) then
+					r = buyBait()
+				end
+			end
+			buyOk = (r == true)
+		else
+			buyOk = false
+		end
+	end
+
+	if not sellOk then
+		tradeBlockedUntilSell = os.clock() + CFG.TRADE_COOLDOWN
+	end
+	if not buyOk then
+		tradeBlockedUntilBuy = os.clock() + CFG.TRADE_COOLDOWN
+		log("ซื้อเหยื่อไม่สำเร็จ พักการซื้อ", CFG.TRADE_COOLDOWN, "วินาที")
+	end
+
+	-- กลับจุดตกปลา และหันทิศเดิม (ทิศการเหวี่ยงขึ้นกับทิศที่ตัวละครหัน)
+	if canRun() then
+		setStatus("กลับจุดตกปลา")
+		local back = walkTo(home.Position, 3)
+		local r2 = getRoot()
+		if back and r2 then
+			r2.CFrame = home
+		else
+			log("กลับจุดเดิมไม่ได้")
+		end
+	end
+end
+
+local function runTrade(needSell, needBuy)
+	busy = true
+	local ok, err = pcall(doTrade, needSell, needBuy)
+	busy = false
+	if not ok then
+		log("ขัดข้องระหว่างซื้อ/ขาย:", tostring(err))
+		tradeBlockedUntilSell = os.clock() + CFG.TRADE_COOLDOWN
+		tradeBlockedUntilBuy = os.clock() + CFG.TRADE_COOLDOWN
+	end
+	pendingSell = false
+	touch()
+	updateUi()
+end
+
+-- กระเป๋าเต็ม: ถ้าเปิดขายอัตโนมัติและไม่ถูกพัก ให้ไปขาย ไม่งั้นรอแล้วลองเหวี่ยงใหม่
+local function handleFull()
+	if S.autoSell and os.clock() >= tradeBlockedUntilSell then
+		pendingSell = true
+		setStatus("กระเป๋าเต็ม ไปขายปลา")
+		task.wait(1)
+	else
+		setStatus("กระเป๋าเต็ม รอ")
+		log("กระเป๋าเต็ม: ลองใหม่ใน", CFG.FULL_RETRY, "วินาที")
+		task.wait(CFG.FULL_RETRY)
+	end
+end
+
+-- ===================== ลูปหลัก =====================
+-- หนึ่งรอบ: [ซื้อ/ขาย ถ้าจำเป็น] -> ถือเบ็ด -> เหวี่ยง -> รอจนจับได้
+-- ทุกกรณีผิดปกติจบรอบแล้วให้ลูปลองใหม่เอง ไม่หยุดถาวร
+local failStreak = 0
+local idleMiss = 0
+
+local function step()
+	-- 0) เกมกำลังตกอยู่แล้ว (เช่น เหวี่ยงต่อให้เองหลังจับได้): รอ ไม่กดเหวี่ยงซ้ำ ไม่เดินหนี
+	if casting and not forceTrade and os.clock() - lastFishEvent > CFG.STALE_CAST then
+		-- server เงียบนานเกินรอบปกติ (เช่น หยุดกลางรอบแล้วปลาหนีไป): ถือว่าไม่ได้ตกอยู่แล้ว
+		log("สถานะกำลังตกค้าง", math.floor(os.clock() - lastFishEvent), "วินาที รีเซ็ตแล้วเหวี่ยงใหม่")
+		casting = false
+		local idle = getIdle()
+		if not (idle and idle.Visible) then
+			pressCastButton()
+			task.wait(1)
+		end
+	end
+	if casting and not forceTrade then
+		-- ไม่เรียก setStatus/touch ที่นี่ เพื่อให้ watchdog จับได้ถ้า casting ค้างเพราะพลาด event
+		statusText = "รอปลากิน"
+		updateUi()
+		task.wait(0.5)
+		return
+	end
+
+	-- 1) ซื้อ/ขาย (เหยื่อหมดซื้อทันที, กระเป๋าเต็มขายทันที)
+	local needSell, needBuy = false, false
+	if forceTrade then
+		needSell, needBuy = shopRemotes ~= nil, shopRemotes ~= nil
+		forceTrade = false
+	else
+		needSell, needBuy = wantSell(), wantBuy()
+	end
+	if needSell or needBuy then
+		runTrade(needSell, needBuy)
+		return
+	end
+
+	-- 2) ถือเบ็ด
+	if not getRod() then
+		setStatus("ถือเบ็ด")
+		if not equipRod() then
+			failStreak = failStreak + 1
+			setStatus("ถือเบ็ดไม่ได้ ลองใหม่")
+			task.wait(3)
+			return
+		end
+	end
+
+	-- 3) รอปุ่มเหวี่ยง
+	setStatus("รอปุ่มเหวี่ยง")
+	if not waitIdleVisible(CFG.IDLE_TIMEOUT) then
+		idleMiss = idleMiss + 1
+		log("ปุ่มเหวี่ยง (Idle) ไม่แสดงภายใน", CFG.IDLE_TIMEOUT, "วินาที ครั้งที่", idleMiss)
+		if idleMiss >= 3 then
+			-- น่าจะค้างสถานะเหวี่ยงอยู่: กดปุ่มเหวี่ยงของเกมเพื่อยกเลิก/รีเซ็ต
+			log("ค้าง: ลองกดปุ่มเหวี่ยงเพื่อรีเซ็ต")
+			pressCastButton()
+			idleMiss = 0
+			task.wait(1)
+		end
+		return
+	end
+	idleMiss = 0
+
+	-- 4) เหวี่ยง
+	cycleDone, cycleReason = false, nil
+	setStatus("เหวี่ยง")
+	if not cast() then
+		if cycleReason == "full" then
+			handleFull()
+			return
+		end
+		failStreak = failStreak + 1
+		local backoff = math.min(CFG.FAIL_BACKOFF * failStreak, 10)
+		setStatus("เหวี่ยงไม่ติด ลองใหม่")
+		log("เหวี่ยงไม่สำเร็จติดกัน", failStreak, "ครั้ง พัก", backoff, "วินาที (ตรวจเหยื่อ/ที่ยืนใกล้น้ำ)")
+		task.wait(backoff)
+		return
+	end
+	failStreak = 0
+	if not S.home then
+		setHomeHere("ตั้งจุดตกปลาอัตโนมัติ")
+	end
+
+	-- 5) รอจนจับได้
+	local t0 = os.clock()
+	while canRun() and not cycleDone and os.clock() - t0 < CFG.CYCLE_TIMEOUT do
+		task.wait(0.2)
+	end
+	if enabled and not cycleDone then
+		log("รอบนี้เกินเวลา", CFG.CYCLE_TIMEOUT, "วินาทีโดยไม่จบ รีเซ็ตแล้วเหวี่ยงใหม่")
+		local idle = getIdle()
+		if not (idle and idle.Visible) then
+			pressCastButton()
+		end
+		task.wait(1)
+	end
+
+	if cycleReason == "full" then
+		handleFull()
+	else
+		task.wait(CFG.RECAST_DELAY)
+	end
+end
+
+task.spawn(function()
+	while running do
+		if enabled and not busy then
+			local ok, err = pcall(step)
+			if not ok then
+				log("ขัดข้องในลูป:", tostring(err))
+				task.wait(2)
+			end
+		else
+			task.wait(0.3)
+		end
+	end
+	copyLog()
+end)
+
+-- ===================== ระบบเฝ้าระวัง (watchdog) =====================
+-- ไม่มีความคืบหน้า (event จาก server / การกด / ขั้นตอนซื้อขาย) เกิน WATCHDOG วินาที = ค้าง -> กู้
+task.spawn(function()
+	while running do
+		task.wait(2)
+		if enabled and not busy and os.clock() - lastProgress > CFG.WATCHDOG then
+			watchdogResets = watchdogResets + 1
+			log("WATCHDOG: ไม่มีความคืบหน้า", math.floor(os.clock() - lastProgress), "วินาที กู้ครั้งที่", watchdogResets)
+			activeChallenge = nil
+			castConfirmed = false
+			casting = false
+			cycleDone = true -- ปลุกลูปที่รออยู่ให้เริ่มรอบใหม่
+			local idle = getIdle()
+			if not (idle and idle.Visible) then
+				pressCastButton()
+			end
+			if watchdogResets >= 3 and not getRod() then
+				bagAction:FireServer("use", rodSlot())
+			end
+			setStatus("ขัดข้อง กู้อัตโนมัติ")
+			touch()
+		end
+	end
+end)
+
+
+-- ===================== กลับจุดเดิม (กันถูกชน/ถูกดัน/ตาย/หยุดพัก) =====================
+-- ทุก GUARD_INTERVAL วินาที: ถ้าออโต้เปิดอยู่ ไม่ได้กำลังซื้อขาย ไม่ได้อยู่ในมินิเกม และไม่ได้นั่งเรือ
+-- แล้วตัวละครห่างจุดตกปลาเกิน HOME_RADIUS ให้กลับจุดเดิมพร้อมหันทิศเดิม
+local function returnHome(reason)
+	local home = homeCFrame()
+	local root, hum = getRoot(), getHum()
+	if not (home and root and hum) then
+		return false
+	end
+	local dist, dy = homeDistance()
+	dist, dy = dist or 0, dy or 0
+	homeReturns = homeReturns + 1
+	log(string.format("กลับจุดเดิม (%s) ห่าง %.1f studs สูงต่างกัน %.1f", reason, dist, dy))
+	if hum.Sit then
+		hum.Sit = false
+		task.wait(0.2)
+	end
+	busy = true
+	setStatus("กลับจุดตกปลา")
+	local ok, reached = true, true
+	if dy > CFG.HOME_FALL_Y then
+		-- หล่นจากจุด (ตกน้ำ/ตกชั้นล่าง) เดินกลับขึ้นไม่ได้: วาร์ปกลับทันที
+		reached = CFG.ALLOW_TELEPORT and cfTo(home.Position, "หล่นจากจุดตกปลา") or false
+	else
+		ok, reached = pcall(walkTo, home.Position, 1.2)
+	end
+	busy = false
+	root = getRoot()
+	if not (ok and reached and root) then
+		log("กลับจุดเดิมไม่สำเร็จ จะลองใหม่")
+		return false
+	end
+	-- ถึงแล้ว: จัดตำแหน่งและทิศให้ตรงจุดเดิมเป๊ะ (ขยับไม่เกินไม่กี่ studs)
+	root.CFrame = home
+	pcall(function()
+		root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	end)
+	touch()
+	updateUi()
+	return true
+end
+
+task.spawn(function()
+	while running do
+		task.wait(CFG.GUARD_INTERVAL)
+		if enabled and S.returnHome and S.home and not busy and not manualRun and not activeChallenge then
+			local hum = getHum()
+			local dist, dy = homeDistance()
+			if hum and not hum.SeatPart and hum.Health ~= 0 and dist and (dist > CFG.HOME_RADIUS or dy > 8) then
+				local ok, err = pcall(returnHome, "ถูกดันหรือออกจากจุด")
+				if not ok then
+					log("กลับจุดเดิมขัดข้อง:", tostring(err))
+				end
+			end
+		end
+		updateUi()
+	end
+end)
+
+-- ===================== กันโดนเตะเพราะ AFK =====================
+local function antiAfkPing(source)
+	if not S.antiAfk then
+		return
+	end
+	local ok = pcall(function()
+		local vu = game:GetService("VirtualUser")
+		vu:CaptureController()
+		vu:ClickButton2(Vector2.new())
+	end)
+	afkPings = afkPings + 1
+	log("กัน AFK (" .. source .. "):", ok and "สำเร็จ" or "ไม่สำเร็จ")
+	updateUi()
+end
+table.insert(conns, lp.Idled:Connect(function()
+	antiAfkPing("เกมแจ้งยืนนิ่ง")
+end))
+task.spawn(function()
+	while running do
+		task.wait(CFG.ANTI_AFK_INTERVAL)
+		if running then
+			antiAfkPing("ตามเวลา")
+		end
+	end
+end)
+
+-- ===================== เข้าเกมใหม่เมื่อหลุด =====================
+local rejoining = false
+local function queueSelf()
+	local q = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+	if not (q and readfile and isfile) then
+		return false
+	end
+	local okExists, exists = pcall(isfile, CFG.SCRIPT_FILE)
+	if not (okExists and exists) then
+		return false
+	end
+	local ok, src = pcall(readfile, CFG.SCRIPT_FILE)
+	if not (ok and type(src) == "string" and #src > 0) then
+		return false
+	end
+	return pcall(q, src)
+end
+
+local function startRejoin(reason)
+	if rejoining or not running or not S.autoRejoin then
+		return
+	end
+	rejoining = true
+	log("หลุดจากเซิร์ฟเวอร์:", tostring(reason), "เข้าใหม่ใน", CFG.REJOIN_DELAY, "วินาที")
+	saveSettings()
+	if writefile then
+		pcall(writefile, CFG.RESUME_FILE, tostring(os.time()) .. ":" .. (enabled and "1" or "0"))
+	end
+	log(queueSelf() and "ตั้งให้สคริปต์รันต่อหลังเข้าเกมใหม่แล้ว" or ("ไม่พบ " .. CFG.SCRIPT_FILE .. " สคริปต์จะไม่รันต่อเอง (ใช้ autoexec แทน)"))
+	statusText = "หลุด กำลังเข้าเกมใหม่"
+	updateUi()
+	task.spawn(function()
+		task.wait(CFG.REJOIN_DELAY)
+		while running and S.autoRejoin do
+			local ok, err = pcall(function()
+				game:GetService("TeleportService"):Teleport(game.PlaceId, lp)
+			end)
+			log("เข้าเกมใหม่:", ok and "ส่งคำขอแล้ว" or tostring(err))
+			task.wait(CFG.REJOIN_RETRY)
+		end
+		rejoining = false
+	end)
+end
+
+pcall(function()
+	table.insert(conns, game:GetService("GuiService").ErrorMessageChanged:Connect(function(msg)
+		if type(msg) == "string" and msg ~= "" then
+			startRejoin(msg)
+		end
+	end))
+end)
+pcall(function()
+	local overlay = game:GetService("CoreGui"):FindFirstChild("RobloxPromptGui")
+	overlay = overlay and overlay:FindFirstChild("promptOverlay")
+	if overlay then
+		table.insert(conns, overlay.ChildAdded:Connect(function(child)
+			if child.Name == "ErrorPrompt" then
+				startRejoin("ErrorPrompt")
+			end
+		end))
+	end
+end)
+
+-- รันหลังเข้าเกมใหม่: ถ้าก่อนหลุดเปิดออโต้อยู่ ให้เริ่มต่อเอง
+local resumeOnLoad = false
+pcall(function()
+	if not (readfile and isfile and isfile(CFG.RESUME_FILE)) then
+		return
+	end
+	local t, on = tostring(readfile(CFG.RESUME_FILE)):match("^(%d+):([01])$")
+	if t and on == "1" and os.time() - tonumber(t) <= CFG.RESUME_WINDOW then
+		resumeOnLoad = true
+	end
+	if writefile then
+		writefile(CFG.RESUME_FILE, "")
+	end
+end)
+
+-- ===================== UI =====================
+-- สร้างใน function แยก: ตัวแปรของ UI ไม่นับรวมขีดจำกัด 200 local ของไฟล์หลัก
+local function buildUi()
+-- ธีม JIRAWAT Premium: ม่วง-ดำ (Dark OLED + neon accent) แสงเรือง เงา ไล่สี แอนิเมชันเบาๆ
+-- ของตกแต่งทุกชิ้นห่อด้วย pcall: ถ้า executor ไม่รองรับบางอย่าง UI ยังใช้งานได้ครบ
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+
+local function rgb(r, g, b)
+	return Color3.fromRGB(r, g, b)
+end
+local C = {
+	bg = rgb(11, 9, 26),
+	header = rgb(22, 14, 50),
+	cardTop = rgb(38, 33, 72),
+	cardBot = rgb(24, 21, 47),
+	card = rgb(30, 27, 58),
+	field = rgb(18, 16, 38),
+	list = rgb(15, 13, 33),
+	muted = rgb(42, 38, 72),
+	mutedTop = rgb(54, 48, 92),
+	track = rgb(52, 48, 84),
+	divider = rgb(50, 44, 86),
+	fg = rgb(238, 240, 250),
+	mutedFg = rgb(150, 158, 186),
+	primary = rgb(124, 58, 237),
+	violet = rgb(139, 92, 246),
+	fuchsia = rgb(192, 38, 211),
+	lilac = rgb(196, 181, 253),
+	border = rgb(91, 33, 182),
+	danger = rgb(239, 68, 68),
+	dangerTop = rgb(127, 29, 29),
+	dangerBot = rgb(69, 10, 30),
+	dangerFg = rgb(254, 190, 190),
+	success = rgb(52, 211, 153),
+	warn = rgb(251, 191, 36),
+	cyan = rgb(34, 211, 238),
+	pink = rgb(244, 114, 182),
+	white = rgb(255, 255, 255),
+	black = rgb(0, 0, 0),
+}
+-- สีประจำระดับปลา / เหยื่อ (ใช้ในดรอปดาวน์)
+local TIER_COLOR = {
+	ALL = rgb(196, 181, 253),
+	common = rgb(160, 174, 192),
+	uncommon = rgb(74, 222, 128),
+	rare = rgb(96, 165, 250),
+	epic = rgb(192, 132, 252),
+	legendary = rgb(251, 191, 36),
+	mystery = rgb(244, 114, 182),
+	winter = rgb(103, 232, 249),
+}
+local BAIT_COLOR = {
+	bait_basic = rgb(74, 222, 128),
+	bait_medium = rgb(56, 189, 248),
+	bait_mystery = rgb(232, 121, 249),
+}
+local FONT = Enum.Font.Gotham
+local FONT_B = Enum.Font.GothamBold
+local FONT_H = Enum.Font.GothamBlack
+
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		o[k] = v
+	end
+	o.Parent = parent
+	return o
+end
+local function corner(o, r)
+	return mk("UICorner", { CornerRadius = UDim.new(0, r) }, o)
+end
+-- เส้นขอบ (ApplyStrokeMode = Border ไม่งั้นบนปุ่ม/ข้อความจะกลายเป็นขอบตัวอักษร)
+local function stroke(o, color, thick, transp, onText)
+	local st = mk("UIStroke", { Color = color, Thickness = thick or 1, Transparency = transp or 0 }, o)
+	if not onText then
+		pcall(function()
+			st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		end)
+	end
+	return st
+end
+local function cseq(cols)
+	if #cols == 1 then
+		return ColorSequence.new(cols[1])
+	end
+	local kps = {}
+	for i, c in ipairs(cols) do
+		kps[i] = ColorSequenceKeypoint.new((i - 1) / (#cols - 1), c)
+	end
+	return ColorSequence.new(kps)
+end
+-- ไล่สี: คืน UIGradient หรือ nil ถ้าไม่รองรับ
+local function grad(o, rot, cols)
+	local g = nil
+	pcall(function()
+		g = mk("UIGradient", { Color = cseq(cols), Rotation = rot or 0 }, o)
+	end)
+	return g
+end
+local function setGrad(g, cols)
+	if g then
+		pcall(function()
+			g.Color = cseq(cols)
+		end)
+	end
+end
+local function fadeGrad(g, a, b)
+	if g then
+		pcall(function()
+			g.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, a), NumberSequenceKeypoint.new(1, b) })
+		end)
+	end
+end
+local function tween(o, t, props, style)
+	local ok = pcall(function()
+		TweenService:Create(o, TweenInfo.new(t, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+	end)
+	if not ok then
+		for k, v in pairs(props) do
+			pcall(function()
+				o[k] = v
+			end)
+		end
+	end
+end
+local function text(parent, props)
+	local base = {
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextSize = 13,
+		TextColor3 = C.fg,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+		Text = "",
+	}
+	for k, v in pairs(props) do
+		base[k] = v
+	end
+	return mk("TextLabel", base, parent)
+end
+
+-- แสงเรือง: ซ้อนกรอบโปร่งใสหลายชั้นรอบ target (ไม่ต้องใช้รูป asset)
+-- วางเป็น sibling ของ target ข้างหลัง (ZIndex ต่ำกว่า) ห้ามใช้กับลูกของ UIListLayout
+local function glow(target, color, layers, step, alpha, radius, offsetY)
+	local holder = nil
+	pcall(function()
+		holder = mk("Frame", {
+			Name = "Glow",
+			BackgroundTransparency = 1,
+			Position = target.Position,
+			Size = target.Size,
+			AnchorPoint = target.AnchorPoint,
+			ZIndex = math.max((target.ZIndex or 1) - 1, 0),
+		}, target.Parent)
+		holder:SetAttribute("layers", layers)
+		for i = 1, layers do
+			local f = mk("Frame", {
+				Name = "L" .. i,
+				BackgroundColor3 = color,
+				BackgroundTransparency = 1 - alpha,
+				BorderSizePixel = 0,
+				Position = UDim2.fromOffset(-i * step, -i * step + (offsetY or 0)),
+				Size = UDim2.new(1, i * step * 2, 1, i * step * 2),
+				ZIndex = holder.ZIndex,
+			}, holder)
+			corner(f, radius + i * step)
+		end
+	end)
+	return holder
+end
+local function glowColor(holder, color, alpha)
+	if not holder then
+		return
+	end
+	pcall(function()
+		for _, f in ipairs(holder:GetChildren()) do
+			if f:IsA("Frame") then
+				f.BackgroundColor3 = color
+				if alpha then
+					f.BackgroundTransparency = 1 - alpha
+				end
+			end
+		end
+	end)
+end
+
+-- ยุบ/เด้งเมื่อแตะ ให้รู้สึกว่ากดโดน
+local function pressable(btn)
+	pcall(function()
+		local sc = mk("UIScale", { Scale = 1 }, btn)
+		btn.MouseButton1Down:Connect(function()
+			tween(sc, 0.08, { Scale = 0.95 })
+		end)
+		local function up()
+			tween(sc, 0.18, { Scale = 1 }, Enum.EasingStyle.Back)
+		end
+		btn.MouseButton1Up:Connect(up)
+		btn.MouseLeave:Connect(up)
+	end)
+end
+
+-- ปุ่มไล่สี: TextButton โปร่งใส + ชั้นสี (Fill) + ข้อความ (Label)
+-- (ใส่ UIGradient บนปุ่มตรงๆ จะย้อมสีตัวอักษรไปด้วย)
+local function setBtnText(b, t, color)
+	b.Text = t
+	local lbl = b:FindFirstChild("Label")
+	if lbl then
+		lbl.Text = t
+		if color then
+			lbl.TextColor3 = color
+		end
+	end
+end
+local function gradButton(parent, props)
+	local b = mk("TextButton", {
+		Name = props.name,
+		Size = props.size,
+		Position = props.pos or UDim2.fromOffset(0, 0),
+		AnchorPoint = props.anchor or Vector2.new(0, 0),
+		BackgroundTransparency = 1,
+		Text = props.text or "",
+		TextTransparency = 1,
+		TextSize = 1,
+		AutoButtonColor = false,
+		LayoutOrder = props.order or 0,
+	}, parent)
+	local fill = mk("Frame", {
+		Name = "Fill",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundColor3 = C.white,
+		BorderSizePixel = 0,
+	}, b)
+	corner(fill, props.radius or 10)
+	local g = grad(fill, props.rot or 0, props.colors)
+	if not g then
+		fill.BackgroundColor3 = props.colors[1]
+	end
+	local st = props.stroke and stroke(fill, props.stroke, 1, props.strokeT or 0.4) or nil
+	-- เงาสะท้อนแสงด้านบน (ครึ่งบนสว่างกว่าเล็กน้อย)
+	local shine = mk("Frame", {
+		Name = "Shine",
+		Size = UDim2.new(1, 0, 0.5, 0),
+		BackgroundColor3 = C.white,
+		BackgroundTransparency = 0.9,
+		BorderSizePixel = 0,
+	}, fill)
+	corner(shine, props.radius or 10)
+	fadeGrad(grad(shine, 90, { C.white, C.white }), 0.2, 1)
+	local lbl = text(b, {
+		Name = "Label",
+		Text = props.text or "",
+		Font = FONT_B,
+		TextSize = props.textSize or 13,
+		TextColor3 = props.textColor or C.white,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Size = UDim2.new(1, 0, 1, 0),
+		ZIndex = 3,
+	})
+	pressable(b)
+	return b, g, fill, st, lbl
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "JirawatGui"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+pcall(function()
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.IgnoreGuiInset = false
+end)
+local okParent = pcall(function()
+	gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okParent or not gui.Parent then
+	gui.Parent = lp:WaitForChild("PlayerGui")
+end
+guiRef = gui
+
+-- ขนาดแผงปรับตามความสูงจอ (มือถือแนวนอนจอเตี้ย)
+local PANEL_W = 304
+local viewportH = 420
+pcall(function()
+	viewportH = workspace.CurrentCamera.ViewportSize.Y
+end)
+local PANEL_H = clamp(math.floor(viewportH - 50), 300, 480)
+local HEADER_H = 50
+
+-- holder = จุดยึด (ลาก/ย่อ) ข้างในมี แสงเรืองม่วง + เงา + แผงจริง
+local holder = mk("Frame", {
+	Name = "Holder",
+	Size = UDim2.fromOffset(PANEL_W, PANEL_H),
+	Position = UDim2.fromOffset(18, 40),
+	BackgroundTransparency = 1,
+}, gui)
+local holderScale = nil
+pcall(function()
+	holderScale = mk("UIScale", { Scale = 0.92 }, holder)
+end)
+local frame = mk("Frame", {
+	Name = "Panel",
+	Size = UDim2.new(1, 0, 1, 0),
+	BackgroundColor3 = C.bg,
+	BorderSizePixel = 0,
+	Active = true,
+	ClipsDescendants = true,
+	ZIndex = 2,
+}, holder)
+corner(frame, 16)
+local auraGlow = glow(frame, C.primary, 7, 2, 0.045, 16)            -- แสงม่วงรอบแผง
+local dropShadow = glow(frame, C.black, 5, 3, 0.09, 16, 4)           -- เงาดำใต้แผง
+grad(frame, 90, { rgb(16, 12, 38), C.bg })
+local panelStroke = stroke(frame, C.white, 1.2, 0)
+local borderGrad = grad(panelStroke, 0, { C.primary, C.fuchsia, C.cyan, C.violet, C.primary }) -- ขอบไล่สีหมุนได้
+
+-- ---------- หัวแผง ----------
+local header = mk("Frame", {
+	Name = "Header",
+	Size = UDim2.new(1, 0, 0, HEADER_H),
+	BackgroundColor3 = C.white,
+	BorderSizePixel = 0,
+	Active = true,
+}, frame)
+corner(header, 16)
+local HEAD_COLS = { rgb(76, 29, 149), rgb(46, 16, 101), rgb(20, 14, 46) }
+if not grad(header, 0, HEAD_COLS) then
+	header.BackgroundColor3 = C.header
+end
+-- ส่วนล่างของหัวแผงเป็นมุมเหลี่ยม ต่อกับเนื้อหาเรียบ (มุมบนโค้งตามแผง)
+local headCover = mk("Frame", { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 1, -16), BackgroundColor3 = C.white, BorderSizePixel = 0 }, header)
+if not grad(headCover, 0, HEAD_COLS) then
+	headCover.BackgroundColor3 = C.header
+end
+-- แสงทแยง (sheen) วิ่งผ่านหัวแผง (อยู่ในกรอบที่เว้นมุมโค้งไว้ ไม่ล้นมุม)
+local sheenClip = mk("Frame", { Size = UDim2.new(1, -32, 1, 0), Position = UDim2.fromOffset(16, 0), BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 2 }, header)
+local sheen = mk("Frame", {
+	Size = UDim2.new(0.5, 0, 1, 0),
+	Position = UDim2.new(-0.6, 0, 0, 0),
+	BackgroundColor3 = C.white,
+	BackgroundTransparency = 0.88,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+}, sheenClip)
+local sheenGrad = grad(sheen, 0, { C.white, C.white, C.white })
+pcall(function()
+	sheenGrad.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.5, 0.3),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+end)
+mk("Frame", { -- เส้นแสงใต้หัวแผง
+	Name = "Underline",
+	Size = UDim2.new(1, 0, 0, 1),
+	Position = UDim2.new(0, 0, 1, -1),
+	BackgroundColor3 = C.white,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+}, header)
+pcall(function()
+	local ul = header:FindFirstChild("Underline")
+	local g = grad(ul, 0, { C.primary, C.fuchsia, C.primary })
+	fadeGrad(g, 0.2, 0.8)
+end)
+local title = text(header, { Text = "JIRAWAT", Font = FONT_H, TextSize = 20, TextColor3 = C.white, Position = UDim2.fromOffset(16, 7), Size = UDim2.fromOffset(150, 22), ZIndex = 3 })
+local titleGrad = grad(title, 90, { C.white, C.lilac })
+pcall(function()
+	stroke(title, C.primary, 1, 0.45, true) -- เรืองรอบตัวอักษร
+end)
+text(header, { Text = "AUTO FISHING SUITE", Font = FONT_B, TextSize = 10, TextColor3 = C.lilac, Position = UDim2.fromOffset(17, 29), Size = UDim2.fromOffset(130, 14), ZIndex = 3 })
+local badge = mk("Frame", { Size = UDim2.fromOffset(34, 16), Position = UDim2.fromOffset(150, 28), BackgroundColor3 = C.white, BorderSizePixel = 0, ZIndex = 3 }, header)
+corner(badge, 8)
+if not grad(badge, 0, { C.violet, C.fuchsia }) then
+	badge.BackgroundColor3 = C.violet
+end
+text(badge, { Text = "PRO", Font = FONT_H, TextSize = 9, TextColor3 = C.white, TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, 0, 1, 0), ZIndex = 4 })
+local headDot = mk("Frame", { Size = UDim2.fromOffset(8, 8), Position = UDim2.new(1, -68, 0.5, -4), BackgroundColor3 = C.mutedFg, BorderSizePixel = 0, ZIndex = 3 }, header)
+corner(headDot, 4)
+local btnMin = gradButton(header, {
+	name = "Minimize",
+	text = "–",
+	size = UDim2.fromOffset(40, 34),
+	pos = UDim2.new(1, -50, 0.5, -17),
+	colors = { C.mutedTop, C.muted },
+	stroke = C.lilac,
+	strokeT = 0.75,
+	textSize = 18,
+	radius = 10,
+	rot = 90,
+})
+btnMin.ZIndex = 3
+
+-- ลากแผงด้วยหัว (รองรับนิ้วและเมาส์)
+pcall(function()
+	local dragging, dragStart, startPos = false, nil, nil
+	table.insert(conns, header.InputBegan:Connect(function(input)
+		local t = input.UserInputType
+		if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, holder.Position
+		end
+	end))
+	table.insert(conns, UIS.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		local t = input.UserInputType
+		if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+			local d = input.Position - dragStart
+			holder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	table.insert(conns, UIS.InputEnded:Connect(function(input)
+		local t = input.UserInputType
+		if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end)
+
+-- ---------- ส่วนคงที่: สถานะ + สถิติ + ปุ่มหลัก ----------
+local body = mk("Frame", {
+	Name = "Body",
+	Position = UDim2.fromOffset(0, HEADER_H),
+	Size = UDim2.new(1, 0, 1, -HEADER_H),
+	BackgroundTransparency = 1,
+}, frame)
+
+local pulse = mk("Frame", { Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(18, 19), AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C.success, BackgroundTransparency = 1, BorderSizePixel = 0 }, body)
+corner(pulse, 10)
+local statusDot = mk("Frame", { Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(14, 15), BackgroundColor3 = C.mutedFg, BorderSizePixel = 0, ZIndex = 2 }, body)
+corner(statusDot, 4)
+local lblStatus = text(body, { Name = "Status", Font = FONT_B, TextSize = 13, Position = UDim2.fromOffset(30, 7), Size = UDim2.new(1, -44, 0, 22), TextTruncate = Enum.TextTruncate.AtEnd })
+
+local statVals = {}
+local STAT_KEYS = {
+	{ "catch", "จับได้", C.lilac },
+	{ "coin", "Coin ที่ขาย", C.warn },
+	{ "trip", "เที่ยวร้าน", C.cyan },
+	{ "bait", "เหยื่อเหลือ", C.pink },
+}
+local tileW = math.floor((PANEL_W - 28 - 18) / 4)
+for i, sk in ipairs(STAT_KEYS) do
+	local tile = mk("Frame", {
+		Size = UDim2.fromOffset(tileW, 42),
+		Position = UDim2.fromOffset(14 + (i - 1) * (tileW + 6), 34),
+		BackgroundColor3 = C.white,
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+	}, body)
+	corner(tile, 10)
+	if not grad(tile, 90, { C.cardTop, C.cardBot }) then
+		tile.BackgroundColor3 = C.card
+	end
+	stroke(tile, sk[3], 1, 0.75)
+	local bar = mk("Frame", { Size = UDim2.new(0.5, 0, 0, 2), Position = UDim2.new(0.25, 0, 0, 0), BackgroundColor3 = sk[3], BorderSizePixel = 0 }, tile)
+	corner(bar, 1)
+	fadeGrad(grad(bar, 0, { sk[3], sk[3] }), 0.6, 0.6)
+	pcall(function()
+		local g = bar:FindFirstChildOfClass("UIGradient")
+		g.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0), NumberSequenceKeypoint.new(1, 1) })
+	end)
+	statVals[sk[1]] = text(tile, { Name = "Stat_" .. sk[1], Text = "0", Font = FONT_H, TextSize = 15, TextColor3 = sk[3], TextXAlignment = Enum.TextXAlignment.Center, Position = UDim2.fromOffset(0, 5), Size = UDim2.new(1, 0, 0, 18) })
+	statVals[sk[1]]:SetAttribute("base", true)
+	text(tile, { Text = sk[2], TextSize = 10, TextColor3 = C.mutedFg, TextXAlignment = Enum.TextXAlignment.Center, Position = UDim2.fromOffset(0, 23), Size = UDim2.new(1, 0, 0, 14) })
+end
+local STAT_BASE = { catch = C.lilac, coin = C.warn, trip = C.cyan, bait = C.pink }
+
+local btnMain, mainGrad, mainFill, mainStroke, mainLabel = gradButton(body, {
+	name = "MainToggle",
+	text = "เริ่มตกปลาอัตโนมัติ",
+	size = UDim2.new(1, -28, 0, 44),
+	pos = UDim2.fromOffset(14, 84),
+	colors = { C.primary, C.fuchsia },
+	stroke = C.lilac,
+	strokeT = 0.5,
+	textSize = 15,
+	radius = 12,
+})
+btnMain.ZIndex = 2
+local mainGlow = glow(btnMain, C.violet, 6, 2, 0.06, 12)
+
+-- ---------- ส่วนเลื่อนได้: หมวดการตั้งค่า ----------
+local SCROLL_Y = 138
+local scroll = mk("ScrollingFrame", {
+	Name = "Scroll",
+	Position = UDim2.fromOffset(0, SCROLL_Y),
+	Size = UDim2.new(1, 0, 1, -SCROLL_Y - 4),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	ScrollBarImageColor3 = C.violet,
+	ScrollBarImageTransparency = 0.2,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	CanvasSize = UDim2.fromOffset(0, 0),
+}, body)
+local scrollLayout = mk("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, scroll)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14), PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 16) }, scroll)
+pcall(function()
+	local function fit()
+		scroll.CanvasSize = UDim2.fromOffset(0, scrollLayout.AbsoluteContentSize.Y + 24)
+	end
+	table.insert(conns, scrollLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(fit))
+	fit()
+end)
+-- ขอบบนส่วนเลื่อนจางลง ให้รู้ว่ามีเนื้อหาเลื่อนเข้ามา
+local topFade = mk("Frame", { Size = UDim2.new(1, 0, 0, 10), Position = UDim2.fromOffset(0, SCROLL_Y), BackgroundColor3 = C.bg, BorderSizePixel = 0, ZIndex = 5 }, body)
+pcall(function()
+	local g = grad(topFade, 90, { C.bg, C.bg })
+	fadeGrad(g, 0, 1)
+end)
+
+local order = 0
+local function nextOrder()
+	order = order + 1
+	return order
+end
+
+local renders = {} -- ฟังก์ชันวาดสถานะของแต่ละตัวควบคุม (เรียกใน updateUi)
+
+-- หมวด: หัวข้อมีแถบสี + การ์ดไล่สี มีเส้นแสงด้านบน
+local function section(title, accent)
+	accent = accent or C.violet
+	local cap = mk("Frame", { LayoutOrder = nextOrder(), Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1 }, scroll)
+	local bar = mk("Frame", { Size = UDim2.fromOffset(3, 12), Position = UDim2.fromOffset(0, 5), BackgroundColor3 = accent, BorderSizePixel = 0 }, cap)
+	corner(bar, 2)
+	text(cap, { Text = title, Font = FONT_B, TextSize = 12, TextColor3 = C.lilac, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -10, 1, 0) })
+	local line = mk("Frame", { Size = UDim2.new(1, -112, 0, 1), Position = UDim2.new(0, 112, 0.5, 0), BackgroundColor3 = accent, BorderSizePixel = 0 }, cap)
+	fadeGrad(grad(line, 0, { accent, accent }), 0.5, 1)
+
+	local card = mk("Frame", {
+		LayoutOrder = nextOrder(),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = C.white,
+		BorderSizePixel = 0,
+	}, scroll)
+	corner(card, 12)
+	if not grad(card, 90, { C.cardTop, C.cardBot }) then
+		card.BackgroundColor3 = C.card
+	end
+	stroke(card, accent, 1, 0.68)
+	local hl = mk("Frame", { Name = "Highlight", Size = UDim2.new(1, -24, 0, 1), Position = UDim2.fromOffset(12, 0), BackgroundColor3 = C.white, BorderSizePixel = 0 }, card)
+	pcall(function()
+		local g = grad(hl, 0, { C.white, C.white, C.white })
+		g.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.75), NumberSequenceKeypoint.new(1, 1) })
+	end)
+	local content = mk("Frame", {
+		Name = "Content",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+	}, card)
+	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, content)
+	mk("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 4) }, content)
+	content:SetAttribute("rows", 0)
+	return content
+end
+
+local function rowOrder(card)
+	local n = (card:GetAttribute("rows") or 0) + 1
+	card:SetAttribute("rows", n)
+	if n > 1 then -- เส้นคั่นระหว่างแถว
+		local d = mk("Frame", { LayoutOrder = n * 2 - 1, Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = C.divider, BorderSizePixel = 0 }, card)
+		pcall(function()
+			local g = grad(d, 0, { C.white, C.white, C.white })
+			g.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.3), NumberSequenceKeypoint.new(1, 1) })
+			d.BackgroundColor3 = C.divider
+		end)
+	end
+	return n * 2
+end
+
+-- สวิตช์: แตะได้ทั้งแถว แสดงตำแหน่งปุ่ม สี และคำว่า เปิด/ปิด (ไม่ใช้สีอย่างเดียว)
+local function switchRow(card, name, title, desc, get, set)
+	local h = desc and 54 or 46
+	local row = mk("TextButton", { Name = name, LayoutOrder = rowOrder(card), Size = UDim2.new(1, 0, 0, h), BackgroundTransparency = 1, Text = "", AutoButtonColor = false }, card)
+	text(row, { Text = title, Font = FONT_B, TextSize = 14, Position = UDim2.fromOffset(0, desc and 8 or 0), Size = UDim2.new(1, -96, 0, desc and 20 or h) })
+	local descLbl
+	if desc then
+		descLbl = text(row, { Name = "Desc", Text = desc, TextSize = 11, TextColor3 = C.mutedFg, Position = UDim2.fromOffset(0, 28), Size = UDim2.new(1, -96, 0, 16), TextTruncate = Enum.TextTruncate.AtEnd })
+	end
+	local state = text(row, { Name = "State", TextSize = 11, Font = FONT_B, TextXAlignment = Enum.TextXAlignment.Right, Position = UDim2.new(1, -94, 0.5, -8), Size = UDim2.fromOffset(40, 16) })
+	local track = mk("Frame", { Name = "Track", Size = UDim2.fromOffset(46, 26), Position = UDim2.new(1, -46, 0.5, -13), BackgroundColor3 = C.track, BorderSizePixel = 0, ZIndex = 2 }, row)
+	corner(track, 13)
+	local trackStroke = stroke(track, C.white, 1, 0.9)
+	local trackGrad = grad(track, 0, { C.primary, C.fuchsia })
+	if trackGrad then
+		trackGrad.Enabled = false
+	end
+	local trackGlow = glow(track, C.fuchsia, 4, 2, 0.07, 13)
+	if trackGlow then
+		trackGlow.Visible = false
+	end
+	local knobHolder = mk("Frame", { Size = UDim2.fromOffset(20, 20), Position = UDim2.fromOffset(3, 3), BackgroundTransparency = 1, ZIndex = 3 }, track)
+	local knobShadow = mk("Frame", { Size = UDim2.new(1, 2, 1, 2), Position = UDim2.fromOffset(-1, 1), BackgroundColor3 = C.black, BackgroundTransparency = 0.6, BorderSizePixel = 0, ZIndex = 3 }, knobHolder)
+	corner(knobShadow, 11)
+	local knob = mk("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = C.white, BorderSizePixel = 0, ZIndex = 4 }, knobHolder)
+	corner(knob, 10)
+	grad(knob, 90, { C.white, rgb(221, 214, 254) })
+	local last = nil
+	local function render()
+		local on = get() and true or false
+		if on == last then
+			return
+		end
+		last = on
+		state.Text = on and "เปิด" or "ปิด"
+		state.TextColor3 = on and C.lilac or C.mutedFg
+		if trackGrad then
+			trackGrad.Enabled = on
+			track.BackgroundColor3 = on and C.white or C.track
+		else
+			track.BackgroundColor3 = on and C.primary or C.track
+		end
+		trackStroke.Transparency = on and 0.6 or 0.9
+		if trackGlow then
+			trackGlow.Visible = on
+		end
+		tween(knobHolder, 0.22, { Position = UDim2.fromOffset(on and 23 or 3, 3) }, Enum.EasingStyle.Back)
+	end
+	row.Activated:Connect(function()
+		set(not get())
+		saveSettings()
+		updateUi()
+	end)
+	renders[#renders + 1] = render
+	return row, descLbl
+end
+
+-- ลูกศร V วาดด้วยเส้นสองเส้น (คมทุกขนาดจอ ไม่พึ่งฟอนต์)
+local function chevron(parent, color)
+	local box = mk("Frame", { Name = "V", Size = UDim2.fromOffset(16, 12), Position = UDim2.new(0.5, 0, 0.5, 1), AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, ZIndex = 5 }, parent)
+	for _, side in ipairs({ { 4.6, 45 }, { 11.4, -45 } }) do
+		local l = mk("Frame", {
+			Size = UDim2.fromOffset(10, 2.4),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromOffset(side[1], 5.6),
+			Rotation = side[2],
+			BackgroundColor3 = color,
+			BorderSizePixel = 0,
+			ZIndex = 5,
+		}, box)
+		corner(l, 2)
+	end
+	return box
+end
+
+-- ดรอปดาวน์: กล่องเลือกมีปุ่ม V สีเด่นด้านขวา แต่ละดรอปดาวน์มีสีประจำ แต่ละตัวเลือกมีสีของตัวเอง
+-- กางในที่ (ไม่ลอยทับ ไม่โดนตัดในส่วนเลื่อน) multi = เลือกได้หลายตัว
+local function dropdown(card, def)
+	local name, accent, accentDark = def.name, def.accent, def.accentDark
+	local options, multi = def.options, def.multi
+	local wrap = mk("Frame", { LayoutOrder = rowOrder(card), Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, card)
+	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, wrap)
+
+	local head = mk("TextButton", { Name = name, LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 60), BackgroundTransparency = 1, Text = "", AutoButtonColor = false }, wrap)
+	local field = mk("Frame", { Name = "Field", Size = UDim2.new(1, 0, 0, 48), Position = UDim2.fromOffset(0, 6), BackgroundColor3 = C.white, BorderSizePixel = 0 }, head)
+	corner(field, 12)
+	if not grad(field, 90, { rgb(26, 23, 54), C.field }) then
+		field.BackgroundColor3 = C.field
+	end
+	local fieldStroke = stroke(field, accent, 1.2, 0.55)
+	local strip = mk("Frame", { Size = UDim2.fromOffset(3, 26), Position = UDim2.new(0, 9, 0.5, -13), BackgroundColor3 = accent, BorderSizePixel = 0 }, field)
+	corner(strip, 2)
+	text(field, { Text = def.title, Font = FONT_B, TextSize = 13, Position = UDim2.fromOffset(20, 5), Size = UDim2.new(1, -140, 0, 18) })
+	local value = text(field, { Name = "Value", Font = FONT_B, TextSize = 12, TextColor3 = accent, Position = UDim2.fromOffset(20, 24), Size = UDim2.new(1, -140, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd })
+	-- จุดสีแสดงระดับที่เลือก (เฉพาะแบบเลือกหลายตัว)
+	local dots = {}
+	if multi then
+		local dotRow = mk("Frame", { Size = UDim2.fromOffset(70, 8), Position = UDim2.new(1, -120, 0.5, -4), BackgroundTransparency = 1 }, field)
+		local n = 0
+		for _, o in ipairs(options) do
+			if o.key ~= "ALL" then
+				local d = mk("Frame", { Size = UDim2.fromOffset(7, 7), Position = UDim2.fromOffset(n * 10, 0), BackgroundColor3 = o.color or accent, BorderSizePixel = 0 }, dotRow)
+				corner(d, 4)
+				dots[o.key] = d
+				n = n + 1
+			end
+		end
+	end
+	-- ปุ่ม V
+	local vbtn = mk("TextButton", { Name = name .. "Chevron", Size = UDim2.fromOffset(40, 38), Position = UDim2.new(1, -45, 0.5, -19), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 3 }, field)
+	local vfill = mk("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = C.white, BorderSizePixel = 0, ZIndex = 3 }, vbtn)
+	corner(vfill, 10)
+	if not grad(vfill, 135, { accent, accentDark }) then
+		vfill.BackgroundColor3 = accent
+	end
+	stroke(vfill, C.white, 1, 0.75)
+	local vglow = glow(vbtn, accent, 4, 2, 0.06, 10)
+	local chev = chevron(vbtn, C.white)
+	pressable(vbtn)
+
+	local list = mk("Frame", { Name = name .. "List", LayoutOrder = 2, Size = UDim2.new(1, 0, 0, #options * 42 + 8), BackgroundColor3 = C.list, BorderSizePixel = 0, Visible = false }, wrap)
+	corner(list, 12)
+	stroke(list, accent, 1, 0.7)
+	local gap = mk("Frame", { LayoutOrder = 3, Size = UDim2.new(1, 0, 0, 10), BackgroundTransparency = 1, Visible = false }, wrap)
+	local items = {}
+	for i, o in ipairs(options) do
+		local col = o.color or accent
+		local b = mk("TextButton", { Name = name .. "_" .. o.key, Size = UDim2.new(1, -8, 0, 38), Position = UDim2.fromOffset(4, 4 + (i - 1) * 42), BackgroundColor3 = col, BackgroundTransparency = 1, Text = "", AutoButtonColor = false }, list)
+		corner(b, 9)
+		local tag = mk("Frame", { Size = UDim2.fromOffset(8, 8), Position = UDim2.new(0, 12, 0.5, -4), BackgroundColor3 = col, BorderSizePixel = 0 }, b)
+		corner(tag, 4)
+		local lbl = text(b, { Name = "Label", Text = o.text, TextSize = 13, Font = FONT_B, Position = UDim2.fromOffset(28, 0), Size = UDim2.new(1, -110, 1, 0) })
+		if o.sub then
+			text(b, { Text = o.sub, TextSize = 11, TextColor3 = C.mutedFg, TextXAlignment = Enum.TextXAlignment.Right, Position = UDim2.new(1, -112, 0, 0), Size = UDim2.fromOffset(74, 38) })
+		end
+		local box = mk("Frame", { Size = UDim2.fromOffset(20, 20), Position = UDim2.new(1, -30, 0.5, -10), BackgroundColor3 = col, BackgroundTransparency = 1, BorderSizePixel = 0 }, b)
+		corner(box, multi and 6 or 10)
+		local boxStroke = stroke(box, C.mutedFg, 1.5, 0.2)
+		local fill = mk("Frame", { Size = UDim2.fromOffset(10, 10), Position = UDim2.fromOffset(5, 5), BackgroundColor3 = col, BorderSizePixel = 0, Visible = false }, box)
+		corner(fill, multi and 3 or 5)
+		items[i] = { btn = b, fill = fill, box = box, stroke = boxStroke, lbl = lbl, key = o.key, color = col }
+		b.Activated:Connect(function()
+			def.onPick(o.key)
+			saveSettings()
+			if not multi then
+				list.Visible, gap.Visible = false, false
+				tween(chev, 0.2, { Rotation = 0 })
+				fieldStroke.Transparency = 0.55
+			end
+			updateUi()
+		end)
+	end
+	local function toggle()
+		local open = not list.Visible
+		list.Visible, gap.Visible = open, open
+		tween(chev, 0.22, { Rotation = open and 180 or 0 }, Enum.EasingStyle.Back)
+		fieldStroke.Transparency = open and 0.05 or 0.55
+		glowColor(vglow, accent, open and 0.12 or 0.06)
+	end
+	head.Activated:Connect(toggle)
+	vbtn.Activated:Connect(toggle)
+	renders[#renders + 1] = function()
+		local v, col = def.getValue()
+		value.Text = v
+		value.TextColor3 = col or accent
+		for _, it in ipairs(items) do
+			local on = def.isOn(it.key)
+			it.fill.Visible = on
+			it.stroke.Color = on and it.color or C.mutedFg
+			it.box.BackgroundTransparency = on and 0.75 or 1
+			it.lbl.TextColor3 = on and C.fg or C.mutedFg
+			it.btn.BackgroundTransparency = on and 0.86 or 1
+		end
+		for key, d in pairs(dots) do
+			d.BackgroundTransparency = def.isOn(key) and 0 or 0.85
+		end
+	end
+	return head
+end
+
+-- แถวตัวเลข: ปุ่ม - / + กดง่ายบนมือถือ และพิมพ์ค่าเองได้
+local function stepperRow(card, name, title, desc, get, set, step, lo, hi)
+	local row = mk("Frame", { LayoutOrder = rowOrder(card), Size = UDim2.new(1, 0, 0, 58), BackgroundTransparency = 1 }, card)
+	text(row, { Text = title, Font = FONT_B, TextSize = 14, Position = UDim2.fromOffset(0, 10), Size = UDim2.new(1, -130, 0, 20) })
+	text(row, { Text = desc, TextSize = 11, TextColor3 = C.mutedFg, Position = UDim2.fromOffset(0, 30), Size = UDim2.new(1, -130, 0, 16), TextTruncate = Enum.TextTruncate.AtEnd })
+	local function sbtn(nm, label, x)
+		local b = gradButton(row, {
+			name = nm,
+			text = label,
+			size = UDim2.fromOffset(38, 38),
+			pos = UDim2.new(1, x, 0.5, -19),
+			colors = { C.mutedTop, C.muted },
+			stroke = C.violet,
+			strokeT = 0.55,
+			textSize = 18,
+			rot = 90,
+		})
+		return b
+	end
+	local minus = sbtn(name .. "Minus", "-", -128)
+	local plus = sbtn(name .. "Plus", "+", -38)
+	local box = mk("TextBox", {
+		Name = name .. "Box",
+		Size = UDim2.fromOffset(44, 38),
+		Position = UDim2.new(1, -86, 0.5, -19),
+		BackgroundColor3 = C.field,
+		Text = "",
+		Font = FONT_H,
+		TextSize = 14,
+		TextColor3 = C.fg,
+		ClearTextOnFocus = false,
+	}, row)
+	corner(box, 10)
+	local boxStroke = stroke(box, C.violet, 1.2, 0.35)
+	pcall(function()
+		box.Focused:Connect(function()
+			boxStroke.Color, boxStroke.Transparency = C.fuchsia, 0
+		end)
+	end)
+	local function apply(n)
+		set(clamp(math.floor(n), lo, hi))
+		saveSettings()
+		updateUi()
+	end
+	minus.Activated:Connect(function()
+		apply(get() - step)
+	end)
+	plus.Activated:Connect(function()
+		apply(get() + step)
+	end)
+	box.FocusLost:Connect(function()
+		boxStroke.Color, boxStroke.Transparency = C.violet, 0.35
+		local n = tonumber(box.Text)
+		if n then
+			apply(n)
+		else
+			updateUi() -- พิมพ์ไม่ใช่ตัวเลข: คืนค่าเดิม
+		end
+	end)
+	renders[#renders + 1] = function()
+		box.Text = tostring(get())
+	end
+end
+
+local STYLE = {
+	primary = { colors = { C.primary, C.fuchsia }, stroke = C.lilac, strokeT = 0.55, textColor = C.white },
+	ghost = { colors = { C.mutedTop, C.muted }, stroke = C.violet, strokeT = 0.55, textColor = C.fg, rot = 90 },
+	danger = { colors = { C.dangerTop, C.dangerBot }, stroke = C.danger, strokeT = 0.35, textColor = C.dangerFg, rot = 90 },
+}
+local function buttonRow(card, defs)
+	local row = mk("Frame", { LayoutOrder = rowOrder(card), Size = UDim2.new(1, 0, 0, 60), BackgroundTransparency = 1 }, card)
+	local n = #defs
+	local out = {}
+	for i, d in ipairs(defs) do
+		local st = STYLE[d.style] or STYLE.ghost
+		out[i] = gradButton(row, {
+			name = d.name,
+			text = d.text,
+			size = UDim2.new(1 / n, n > 1 and -4 or 0, 0, 42),
+			pos = UDim2.new((i - 1) / n, (i > 1) and 4 or 0, 0.5, -21),
+			colors = st.colors,
+			stroke = st.stroke,
+			strokeT = st.strokeT,
+			textColor = st.textColor,
+			rot = st.rot,
+		})
+	end
+	return table.unpack(out)
+end
+
+local function infoRow(card, name)
+	local row = mk("Frame", { LayoutOrder = rowOrder(card), Size = UDim2.new(1, 0, 0, 42), BackgroundTransparency = 1 }, card)
+	return text(row, { Name = name, TextSize = 12, TextColor3 = C.mutedFg, Size = UDim2.new(1, 0, 1, 0), TextWrapped = true })
+end
+
+-- ===== หมวด: จุดตกปลา =====
+local cHome = section("จุดตกปลา", C.violet)
+switchRow(cHome, "ReturnHome", "กลับจุดเดิมอัตโนมัติ", "หลังซื้อขาย ถูกชน หรือตาย", function()
+	return S.returnHome
+end, function(v)
+	S.returnHome = v
+end)
+local lblHome = infoRow(cHome, "HomeInfo")
+local btnSetHome, btnClearHome = buttonRow(cHome, {
+	{ name = "SetHome", text = "ตั้งจุดนี้", style = "primary" },
+	{ name = "ClearHome", text = "ล้างจุด", style = "ghost" },
+})
+
+-- ===== หมวด: ขายปลา =====
+local function cap(k)
+	return k:sub(1, 1):upper() .. k:sub(2)
+end
+local cSell = section("ขายปลา", C.warn)
+switchRow(cSell, "AutoSell", "ขายอัตโนมัติ", "ไปขายเมื่อกระเป๋าเต็ม", function()
+	return S.autoSell
+end, function(v)
+	S.autoSell = v
+end)
+local sellOptions = { { key = "ALL", text = "ทั้งหมด", sub = "ทุกระดับ", color = TIER_COLOR.ALL } }
+for _, k in ipairs(KIND_LIST) do
+	sellOptions[#sellOptions + 1] = { key = k, text = cap(k), color = TIER_COLOR[k] }
+end
+dropdown(cSell, {
+	name = "SellKinds",
+	title = "ระดับที่ขาย",
+	accent = C.warn,
+	accentDark = rgb(180, 83, 9),
+	options = sellOptions,
+	multi = true,
+	getValue = function()
+		if S.sellAll then
+			return "ทั้งหมด", C.lilac
+		end
+		local names, first = {}, nil
+		for _, k in ipairs(KIND_LIST) do
+			if S.sellKinds[k] then
+				names[#names + 1] = cap(k)
+				first = first or TIER_COLOR[k]
+			end
+		end
+		if #names == 0 then
+			return "ยังไม่เลือก", C.danger
+		end
+		if #names > 2 then
+			return names[1] .. " +" .. (#names - 1), first
+		end
+		return table.concat(names, ", "), first
+	end,
+	isOn = function(key)
+		if key == "ALL" then
+			return S.sellAll
+		end
+		return S.sellAll or S.sellKinds[key] == true
+	end,
+	onPick = function(key)
+		if key == "ALL" then
+			S.sellAll = not S.sellAll
+			for _, k in ipairs(KIND_LIST) do
+				S.sellKinds[k] = S.sellAll
+			end
+			return
+		end
+		if S.sellAll then
+			-- เลือกทั้งหมดอยู่: แตะระดับไหน = เอาระดับนั้นออก
+			S.sellAll = false
+			for _, k in ipairs(KIND_LIST) do
+				S.sellKinds[k] = (k ~= key)
+			end
+		else
+			S.sellKinds[key] = not S.sellKinds[key]
+			local all = true
+			for _, k in ipairs(KIND_LIST) do
+				if not S.sellKinds[k] then
+					all = false
+				end
+			end
+			S.sellAll = all
+		end
+	end,
+})
+
+-- ===== หมวด: ซื้อเหยื่อ =====
+local cBuy = section("ซื้อเหยื่อ", C.cyan)
+switchRow(cBuy, "AutoBuy", "ซื้ออัตโนมัติ", "ไปซื้อเมื่อเหยื่อหมด", function()
+	return S.autoBuy
+end, function(v)
+	S.autoBuy = v
+end)
+local baitOptions = {}
+for _, b in ipairs(BAITS) do
+	baitOptions[#baitOptions + 1] = { key = b.id, text = b.name, sub = b.price .. " Coin", color = BAIT_COLOR[b.id] }
+end
+dropdown(cBuy, {
+	name = "Bait",
+	title = "ชนิดเหยื่อ",
+	accent = C.cyan,
+	accentDark = rgb(14, 116, 144),
+	options = baitOptions,
+	multi = false,
+	getValue = function()
+		local b = baitInfo(S.bait)
+		return b.name, BAIT_COLOR[b.id]
+	end,
+	isOn = function(key)
+		return S.bait == key
+	end,
+	onPick = function(key)
+		S.bait = key
+	end,
+})
+stepperRow(cBuy, "BuyQty", "จำนวนที่ซื้อ", "ชิ้นต่อหนึ่งเที่ยว", function()
+	return S.buyQty
+end, function(v)
+	S.buyQty = v
+end, 10, 1, 9999)
+stepperRow(cBuy, "BuyBelow", "ซื้อเมื่อเหลือ", "0 = ซื้อตอนหมดพอดี", function()
+	return S.buyBelow
+end, function(v)
+	S.buyBelow = v
+end, 1, 0, 999)
+
+-- ===== หมวด: ป้องกัน =====
+local cGuard = section("ป้องกัน", C.success)
+local _, lblAfkDesc = switchRow(cGuard, "AntiAfk", "กัน AFK", "กันโดนเตะเมื่อยืนนิ่งนาน", function()
+	return S.antiAfk
+end, function(v)
+	S.antiAfk = v
+end)
+switchRow(cGuard, "AutoRejoin", "เข้าเกมใหม่เมื่อหลุด", "หลุดแล้วเข้าใหม่และตกต่อ", function()
+	return S.autoRejoin
+end, function(v)
+	S.autoRejoin = v
+end)
+
+-- ===== หมวด: เครื่องมือ =====
+local cTools = section("เครื่องมือ", C.pink)
+local btnNow, btnCopy = buttonRow(cTools, {
+	{ name = "TradeNow", text = "ขาย/ซื้อตอนนี้", style = "ghost" },
+	{ name = "CopyLog", text = "คัดลอก log", style = "ghost" },
+})
+local btnKill = buttonRow(cTools, { { name = "KillScript", text = "ปิดสคริปต์", style = "danger" } })
+
+text(scroll, { LayoutOrder = nextOrder(), Text = "JIRAWAT PRO v3.1  ·  ตั้งค่าบันทึกอัตโนมัติ", TextSize = 10, TextColor3 = C.mutedFg, TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, 0, 0, 18) })
+
+-- ---------- แจ้งเตือนลอย (toast) ----------
+local toast = mk("Frame", {
+	Name = "Toast",
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 1, 12),
+	Size = UDim2.new(1, -28, 0, 36),
+	BackgroundColor3 = C.white,
+	BorderSizePixel = 0,
+	ZIndex = 20,
+}, frame)
+corner(toast, 10)
+if not grad(toast, 0, { rgb(46, 16, 101), rgb(30, 27, 58) }) then
+	toast.BackgroundColor3 = C.card
+end
+stroke(toast, C.violet, 1, 0.3)
+local toastBar = mk("Frame", { Size = UDim2.fromOffset(3, 20), Position = UDim2.new(0, 10, 0.5, -10), BackgroundColor3 = C.fuchsia, BorderSizePixel = 0, ZIndex = 21 }, toast)
+corner(toastBar, 2)
+local toastLbl = text(toast, { Name = "ToastText", Font = FONT_B, TextSize = 12, Position = UDim2.fromOffset(22, 0), Size = UDim2.new(1, -30, 1, 0), ZIndex = 21, TextTruncate = Enum.TextTruncate.AtEnd })
+local toastSeq = 0
+local function flash(t)
+	toastSeq = toastSeq + 1
+	local my = toastSeq
+	toastLbl.Text = t
+	tween(toast, 0.28, { Position = UDim2.new(0.5, 0, 1, -48) }, Enum.EasingStyle.Back)
+	task.delay(2.4, function()
+		if running and my == toastSeq then
+			tween(toast, 0.2, { Position = UDim2.new(0.5, 0, 1, 12) })
+		end
+	end)
+end
+
+-- ---------- แอนิเมชันพื้นหลัง (ขอบไล่สีหมุน, แสงวิ่งผ่านหัว, จุดสถานะเต้น) ----------
+pcall(function()
+	local t0 = os.clock()
+	table.insert(conns, RunService.Heartbeat:Connect(function()
+		if not running or not frame.Parent then
+			return
+		end
+		local t = os.clock() - t0
+		if borderGrad then
+			borderGrad.Rotation = (t * 45) % 360
+		end
+		local p = (t % 5) / 5 -- แสงวิ่งผ่านหัวทุก 5 วินาที
+		sheen.Position = UDim2.new(-0.6 + p * 2.2, 0, 0, 0)
+		if titleGrad then
+			titleGrad.Offset = Vector2.new(0, math.sin(t * 2) * 0.15)
+		end
+	end))
+end)
+task.spawn(function()
+	while running do
+		if enabled and frame.Parent then
+			pulse.Size = UDim2.fromOffset(8, 8)
+			pulse.BackgroundTransparency = 0.35
+			pulse.BackgroundColor3 = busy and C.warn or C.success
+			tween(pulse, 1.1, { Size = UDim2.fromOffset(22, 22), BackgroundTransparency = 1 })
+		end
+		task.wait(1.4)
+	end
+end)
+
+-- ---------- วาดสถานะทั้งหมด ----------
+updateUi = function()
+	if not running then
+		return
+	end
+	local dot
+	if rejoining then
+		dot = C.warn
+	elseif enabled then
+		dot = busy and C.warn or C.success
+	else
+		dot = C.mutedFg
+	end
+	statusDot.BackgroundColor3 = dot
+	headDot.BackgroundColor3 = dot
+	if rejoining then
+		lblStatus.Text = statusText
+	elseif enabled then
+		lblStatus.Text = "กำลังทำงาน  ·  " .. statusText
+	elseif manualRun then
+		lblStatus.Text = "ซื้อ/ขายแบบสั่งเอง  ·  " .. statusText
+	else
+		lblStatus.Text = "หยุดอยู่  ·  แตะปุ่มเริ่มด้านล่าง"
+	end
+	lblStatus.TextColor3 = enabled and C.fg or C.mutedFg
+	statVals.catch.Text = tostring(catches)
+	statVals.coin.Text = tostring(coinsEarned)
+	statVals.trip.Text = tostring(trips)
+	local bc = baitCount(S.bait)
+	statVals.bait.Text = bc and tostring(bc) or "-"
+	statVals.bait.TextColor3 = (bc and bc <= S.buyBelow) and C.danger or STAT_BASE.bait
+
+	if enabled then
+		setBtnText(btnMain, "หยุดตกปลา", C.dangerFg)
+		setGrad(mainGrad, { C.dangerTop, C.dangerBot })
+		if not mainGrad then
+			mainFill.BackgroundColor3 = C.dangerTop
+		end
+		mainStroke.Color = C.danger
+		glowColor(mainGlow, C.danger, 0.05)
+	else
+		setBtnText(btnMain, "เริ่มตกปลาอัตโนมัติ", C.white)
+		setGrad(mainGrad, { C.primary, C.fuchsia })
+		if not mainGrad then
+			mainFill.BackgroundColor3 = C.primary
+		end
+		mainStroke.Color = C.lilac
+		glowColor(mainGlow, C.violet, 0.06)
+	end
+
+	if S.home then
+		local d = homeDistance()
+		lblHome.Text = string.format("X %.0f   Y %.0f   Z %.0f   ·   ห่าง %s   ·   กลับมาแล้ว %d ครั้ง",
+			S.home.x, S.home.y, S.home.z, d and string.format("%.1f", d) or "-", homeReturns)
+		lblHome.TextColor3 = C.fg
+	else
+		lblHome.Text = "ยังไม่ตั้งจุด  ·  จะจำให้เองตอนเหวี่ยงครั้งแรก"
+		lblHome.TextColor3 = C.mutedFg
+	end
+	if lblAfkDesc then
+		lblAfkDesc.Text = afkPings > 0 and ("ทำงานแล้ว " .. afkPings .. " ครั้ง") or "กันโดนเตะเมื่อยืนนิ่งนาน"
+	end
+	for _, r in ipairs(renders) do
+		r()
+	end
+end
+
+-- ---------- การกด ----------
+local function setEnabled(v)
+	if v == enabled then
+		return
+	end
+	enabled = v
+	if enabled then
+		failStreak, idleMiss, watchdogResets = 0, 0, 0
+		cycleDone = true
+		touch()
+		log("เริ่มตกปลาอัตโนมัติ")
+		setStatus("เริ่ม")
+		flash("เริ่มตกปลาอัตโนมัติแล้ว")
+	else
+		activeChallenge = nil
+		log("หยุดตกปลา")
+		updateUi()
+		flash("หยุดตกปลาแล้ว")
+	end
+end
+
+btnMain.Activated:Connect(function()
+	setEnabled(not enabled)
+end)
+btnSetHome.Activated:Connect(function()
+	if setHomeHere("ตั้งจุดตกปลาด้วยมือ") then
+		flash("บันทึกจุดตกปลาแล้ว")
+	else
+		flash("ตั้งจุดไม่ได้: ไม่พบตัวละคร")
+	end
+end)
+btnClearHome.Activated:Connect(function()
+	S.home = nil
+	saveSettings()
+	log("ล้างจุดตกปลา")
+	updateUi()
+	flash("ล้างจุดแล้ว จะจำใหม่ตอนเหวี่ยงครั้งถัดไป")
+end)
+btnNow.Activated:Connect(function()
+	if not shopRemotes then
+		flash("ไม่พบร้านค้าในเกมนี้")
+		return
+	end
+	if enabled then
+		forceTrade = true
+		log("สั่งซื้อ/ขายตอนนี้ (รอบถัดไป)")
+		flash("จะไปซื้อ/ขายในรอบถัดไป")
+	elseif not busy then
+		log("สั่งซื้อ/ขายตอนนี้")
+		flash("กำลังไปซื้อ/ขาย")
+		task.spawn(function()
+			manualRun = true
+			runTrade(true, true)
+			manualRun = false
+			updateUi()
+		end)
+	end
+end)
+btnCopy.Activated:Connect(function()
+	copyLog()
+	flash("คัดลอก log แล้ว")
+end)
+local killArmedUntil = 0
+btnKill.Activated:Connect(function()
+	-- ปิดสคริปต์ย้อนกลับไม่ได้: แตะสองครั้งภายใน 3 วินาทีเพื่อยืนยัน
+	if os.clock() < killArmedUntil then
+		env.AF_STOP()
+		return
+	end
+	killArmedUntil = os.clock() + 3
+	setBtnText(btnKill, "แตะอีกครั้งเพื่อยืนยัน")
+	task.delay(3, function()
+		if running and btnKill then
+			setBtnText(btnKill, "ปิดสคริปต์")
+		end
+	end)
+end)
+
+local minimized = false
+btnMin.Activated:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	tween(holder, 0.25, { Size = UDim2.fromOffset(PANEL_W, minimized and HEADER_H or PANEL_H) })
+	setBtnText(btnMin, minimized and "+" or "–")
+end)
+
+updateUi()
+if holderScale then
+	tween(holderScale, 0.35, { Scale = 1 }, Enum.EasingStyle.Back) -- เปิดแผงแบบเด้งเบาๆ
+end
+log("JIRAWAT โหลดแล้ว แตะ \"เริ่มตกปลาอัตโนมัติ\" เพื่อเริ่ม (AF_STOP() ปิดสคริปต์, AF_COPY() คัดลอก log)")
+if CFG.AUTO_START or resumeOnLoad then
+	task.delay(3, function()
+		if running then
+			log(resumeOnLoad and "เข้าเกมใหม่หลังหลุด: เริ่มตกต่อ" or "AUTO_START")
+			setEnabled(true)
+		end
+	end)
+end
+end
+buildUi()
